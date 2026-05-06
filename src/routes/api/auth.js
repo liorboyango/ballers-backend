@@ -1,49 +1,39 @@
 /**
  * Auth Routes
- *
- * Placeholder routes for authentication endpoints.
- * Full implementation in Task 4 (auth controllers).
+ * POST /api/auth/register  - Create a new user account
+ * POST /api/auth/login     - Authenticate and receive JWT
+ * GET  /api/auth/me        - Get current user profile (protected)
  */
-
-'use strict';
 
 const express = require('express');
 const router = express.Router();
+const { register, login, getMe } = require('../../controllers/authCtrl');
+const { protect } = require('../../middleware/auth');
 
 /**
  * @route   POST /api/auth/register
  * @desc    Register a new user
  * @access  Public
+ * @body    { name: string, email: string, password: string }
+ * @returns { success, message, token, user }
  */
-router.post('/register', (req, res) => {
-  res.status(501).json({
-    success: false,
-    error: 'Not implemented yet. Coming in Task 4.',
-  });
-});
+router.post('/register', register);
 
 /**
  * @route   POST /api/auth/login
- * @desc    Login user and return JWT
+ * @desc    Login and receive JWT
  * @access  Public
+ * @body    { email: string, password: string }
+ * @returns { success, message, token, user }
  */
-router.post('/login', (req, res) => {
-  res.status(501).json({
-    success: false,
-    error: 'Not implemented yet. Coming in Task 4.',
-  });
-});
+router.post('/login', login);
 
 /**
  * @route   GET /api/auth/me
- * @desc    Get current authenticated user profile
- * @access  Protected
+ * @desc    Get current authenticated user
+ * @access  Protected (JWT required)
+ * @returns { success, user }
  */
-router.get('/me', (req, res) => {
-  res.status(501).json({
-    success: false,
-    error: 'Not implemented yet. Coming in Task 4.',
-  });
-});
+router.get('/me', protect, getMe);
 
 module.exports = router;
