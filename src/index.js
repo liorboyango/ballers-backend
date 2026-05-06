@@ -1,8 +1,8 @@
 /**
  * Ballers Backend - Main Entry Point
- * Express server with middleware stack, route registration, and database connection.
+ * Express server with MongoDB connection, middleware stack, and API routes.
+ * Security: helmet, CORS, rate-limiting, JWT auth, input validation.
  */
-
 require('dotenv').config();
 
 const express = require('express');
@@ -14,136 +14,157 @@ const path = require('path');
 
 const connectDB = require('./services/db');
 const logger = require('./utils/logger');
-const errorHandler = require('./middleware/error');
+const { sanitizeInput } = require('./utils/sanitize');
+const { errorHandler, notFoundHandler } = require('./middleware/error');
+const { RATE_LIMIT } = require('./utils/constants');
 
-// Route imports
-const authRoutes = require('./routes/api/auth');
-const productRoutes = require('./routes/api/products');
-const teamRoutes = require('./routes/api/teams');
-const cartRoutes = require('./routes/api/cart');
-const orderRoutes = require('./routes/api/orders');
-const uploadRoutes = require('./routes/api/upload');
-
-// Validate required environment variables
-const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET'];
-const missingEnvVars = requiredEnvVars.filter((v) => !process.env[v]);
-if (missingEnvVars.length > 0) {
-  logger.error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
+// ─────────────────────────────────────────────
+// ENVIRONMENT VALIDATION
+// ─────────────────────────────────────────────
+const REQUIRED_ENV_VARS = ['MONGO_URI', 'JWT_SECRET'];
+const missingVars = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
+if (missingVars.length > 0) {
+  logger.error(`Missing required environment variables: ${missingVars.join(', ')}`);
   process.exit(1);
 }
 
+// ─────────────────────────────────────────────
+// APP INITIALIZATION
+// ─────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ─── Security Middleware ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// SECURITY MIDDLEWARE
+// ─────────────────────────────────────────────
 
-// Helmet: sets various HTTP headers for security
-// Configure to allow serving images from /uploads
-app.use(
-  helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-  })
-);
+// Set security HTTP headers
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow serving uploaded images
+}));
 
-// CORS: allow requests from frontend origin
+// CORS configuration
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:3000',
-  'http://localhost:3000',
-  'http://localhost:3001',
+  'https://ballers-app.onrender.com',
 ];
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (mobile apps, curl, etc.)
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error(`CORS policy: origin ${origin} not allowed`));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`CORS policy: Origin ${origin} is not allowed.`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
-// Rate limiting: 100 requests per minute per IP
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100,
+// Global rate limiter (100 requests per minute per IP)
+const globalLimiter = rateLimit({
+  windowMs: RATE_LIMIT.WINDOW_MS,
+  max: RATE_LIMIT.MAX_REQUESTS,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    error: 'Too many requests. Please try again later.',
-    code: 'RATE_LIMIT_EXCEEDED',
+    status: 'fail',
+    message: 'Too many requests from this IP. Please try again in a minute.',
   },
 });
-app.use('/api/', limiter);
 
-// ─── Request Parsing Middleware ────────────────────────────────────────────────
+// Stricter rate limiter for auth endpoints (10 requests per minute)
+const authLimiter = rateLimit({
+  windowMs: RATE_LIMIT.WINDOW_MS,
+  max: RATE_LIMIT.AUTH_MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    status: 'fail',
+    message: 'Too many authentication attempts. Please try again in a minute.',
+  },
+});
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/api/', globalLimiter);
+app.use('/api/auth/', authLimiter);
 
-// ─── Logging Middleware ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// GENERAL MIDDLEWARE
+// ─────────────────────────────────────────────
 
-if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }));
-}
+// HTTP request logging
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// ─── Static Files ──────────────────────────────────────────────────────────────
+// Parse JSON bodies (limit 10kb to prevent large payload attacks)
+app.use(express.json({ limit: '10kb' }));
 
-// Serve uploaded product images as static files
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+// Parse URL-encoded bodies
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
-// ─── API Routes ────────────────────────────────────────────────────────────────
+// Sanitize all incoming request data (XSS protection)
+app.use(sanitizeInput);
 
-app.use('/api/auth', authRoutes);
-app.use('/api/teams', teamRoutes);
-app.use('/api/products', productRoutes);
-app.use('/api/cart', cartRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/upload', uploadRoutes);
+// Serve uploaded files statically
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
-// ─── Health Check ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// API ROUTES
+// ─────────────────────────────────────────────
+app.use('/api/auth', require('./routes/api/auth'));
+app.use('/api/teams', require('./routes/api/teams'));
+app.use('/api/products', require('./routes/api/products'));
+app.use('/api/cart', require('./routes/api/cart'));
+app.use('/api/orders', require('./routes/api/orders'));
 
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
+    service: 'ballers-backend',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development',
   });
 });
 
-// ─── 404 Handler ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// ERROR HANDLING (must be LAST)
+// ─────────────────────────────────────────────
 
-app.use((req, res) => {
-  res.status(404).json({
-    error: `Route ${req.method} ${req.originalUrl} not found.`,
-    code: 'NOT_FOUND',
-  });
-});
+// 404 handler for undefined routes
+app.use(notFoundHandler);
 
-// ─── Centralized Error Handler ─────────────────────────────────────────────────
-
+// Global error handler
 app.use(errorHandler);
 
-// ─── Start Server ──────────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────
+// DATABASE CONNECTION & SERVER START
+// ─────────────────────────────────────────────
 const startServer = async () => {
   try {
     await connectDB();
     app.listen(PORT, () => {
-      logger.info(`Ballers backend running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
-      logger.info(`Uploads served at /uploads`);
+      logger.info(`Ballers backend running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
     });
-  } catch (error) {
-    logger.error('Failed to start server:', error);
+  } catch (err) {
+    logger.error('Failed to start server:', err);
     process.exit(1);
   }
 };
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise Rejection:', { reason, promise });
+  // Graceful shutdown
+  process.exit(1);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught Exception:', err);
+  process.exit(1);
+});
 
 startServer();
 

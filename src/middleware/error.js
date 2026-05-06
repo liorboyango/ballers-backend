@@ -1,133 +1,166 @@
 /**
  * Centralized Error Handling Middleware
- *
- * Provides consistent JSON error responses across the entire API.
- * Handles Mongoose validation errors, cast errors, duplicate key errors,
- * JWT errors, and generic server errors.
+ * Catches all errors passed via next(err) and returns consistent JSON responses.
+ * Handles Mongoose errors, JWT errors, and custom AppErrors.
+ * In development: includes stack traces. In production: hides internal details.
  */
-
-'use strict';
-
+const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
 
 /**
- * 404 Not Found handler.
- * Called when no route matches the incoming request.
- *
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} next
+ * Handle Mongoose CastError (invalid ObjectId format)
+ * @param {Error} err - Mongoose CastError
+ * @returns {AppError} Formatted 400 error
  */
-function notFoundHandler(req, res, next) {
-  const err = new Error(`Route not found: ${req.method} ${req.originalUrl}`);
-  err.statusCode = 404;
-  next(err);
-}
+const handleCastErrorDB = (err) => {
+  const message = `Invalid ${err.path}: ${err.value}. Please provide a valid ID.`;
+  return new AppError(message, 400);
+};
 
 /**
- * Centralized error handler middleware.
- * Must be registered LAST in the middleware chain.
- *
- * Handles the following error types:
- * - Mongoose ValidationError (400)
- * - Mongoose CastError / invalid ObjectId (400)
- * - Mongoose duplicate key error (409)
- * - JWT errors (401)
- * - Custom errors with statusCode property
- * - Generic server errors (500)
- *
- * @param {Error} err - The error object
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} next
+ * Handle Mongoose duplicate key error (code 11000)
+ * @param {Error} err - Mongoose duplicate key error
+ * @returns {AppError} Formatted 409 error
  */
-// eslint-disable-next-line no-unused-vars
-function errorHandler(err, req, res, next) {
-  let statusCode = err.statusCode || err.status || 500;
-  let message = err.message || 'Internal Server Error';
-  let errors = null;
+const handleDuplicateFieldsDB = (err) => {
+  const field = Object.keys(err.keyValue || {})[0] || 'field';
+  const value = err.keyValue ? err.keyValue[field] : 'unknown';
+  const message = `Duplicate value for ${field}: "${value}". Please use a different value.`;
+  return new AppError(message, 409);
+};
 
-  // ── Mongoose Validation Error ──────────────────────────────────────────────
-  if (err.name === 'ValidationError') {
-    statusCode = 400;
-    message = 'Validation failed.';
-    errors = Object.values(err.errors).map((e) => ({
-      field: e.path,
-      message: e.message,
-    }));
+/**
+ * Handle Mongoose validation errors
+ * @param {Error} err - Mongoose ValidationError
+ * @returns {AppError} Formatted 400 error with field details
+ */
+const handleValidationErrorDB = (err) => {
+  const errors = Object.values(err.errors).map((el) => ({
+    field: el.path,
+    message: el.message,
+  }));
+  const message = `Validation failed. Please check the provided data.`;
+  return new AppError(message, 400, errors);
+};
+
+/**
+ * Handle invalid JWT token
+ * @returns {AppError} Formatted 401 error
+ */
+const handleJWTError = () =>
+  new AppError('Invalid authentication token. Please log in again.', 401);
+
+/**
+ * Handle expired JWT token
+ * @returns {AppError} Formatted 401 error
+ */
+const handleJWTExpiredError = () =>
+  new AppError('Your session has expired. Please log in again.', 401);
+
+/**
+ * Handle Multer file upload errors
+ * @param {Error} err - Multer error
+ * @returns {AppError} Formatted 400 error
+ */
+const handleMulterError = (err) => {
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return new AppError('File too large. Maximum size is 5MB.', 400);
   }
-
-  // ── Mongoose CastError (invalid ObjectId) ─────────────────────────────────
-  else if (err.name === 'CastError') {
-    statusCode = 400;
-    message = `Invalid value for field '${err.path}': ${err.value}`;
+  if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+    return new AppError('Unexpected file field. Only "image" field is allowed.', 400);
   }
+  return new AppError(`File upload error: ${err.message}`, 400);
+};
 
-  // ── MongoDB Duplicate Key Error ───────────────────────────────────────────
-  else if (err.code === 11000) {
-    statusCode = 409;
-    const field = Object.keys(err.keyValue || {})[0] || 'field';
-    message = `A record with this ${field} already exists.`;
-  }
+/**
+ * Send detailed error response in development environment
+ * Includes stack trace and full error object for debugging
+ */
+const sendErrorDev = (err, req, res) => {
+  logger.error(`[DEV ERROR] ${err.status} ${err.statusCode}: ${err.message}`, {
+    stack: err.stack,
+    url: req.originalUrl,
+    method: req.method,
+  });
 
-  // ── JWT Errors ────────────────────────────────────────────────────────────
-  else if (err.name === 'JsonWebTokenError') {
-    statusCode = 401;
-    message = 'Invalid authentication token.';
-  } else if (err.name === 'TokenExpiredError') {
-    statusCode = 401;
-    message = 'Authentication token has expired.';
-  }
+  res.status(err.statusCode).json({
+    status: err.status,
+    error: err,
+    message: err.message,
+    errors: err.errors || undefined,
+    stack: err.stack,
+  });
+};
 
-  // ── Log server errors (5xx) ───────────────────────────────────────────────
-  if (statusCode >= 500) {
-    logger.error(`[${req.method}] ${req.originalUrl} - ${statusCode}: ${message}`, {
-      stack: err.stack,
-      body: req.body,
-      params: req.params,
-      query: req.query,
-      user: req.user ? req.user.id : 'unauthenticated',
+/**
+ * Send safe error response in production environment
+ * Only exposes operational errors; hides programming errors
+ */
+const sendErrorProd = (err, req, res) => {
+  // Operational, trusted error: send message to client
+  if (err.isOperational) {
+    logger.warn(`[OPERATIONAL ERROR] ${err.statusCode}: ${err.message}`, {
+      url: req.originalUrl,
+      method: req.method,
     });
-  } else {
-    logger.warn(`[${req.method}] ${req.originalUrl} - ${statusCode}: ${message}`);
+
+    return res.status(err.statusCode).json({
+      status: err.status,
+      message: err.message,
+      errors: err.errors || undefined,
+    });
   }
 
-  // ── Build response ────────────────────────────────────────────────────────
-  const response = {
-    success: false,
-    error: message,
-  };
+  // Programming or unknown error: don't leak details
+  logger.error(`[UNEXPECTED ERROR] ${err.message}`, {
+    stack: err.stack,
+    url: req.originalUrl,
+    method: req.method,
+  });
 
-  if (errors) {
-    response.errors = errors;
-  }
-
-  // Include stack trace in development only
-  if (process.env.NODE_ENV === 'development') {
-    response.stack = err.stack;
-  }
-
-  res.status(statusCode).json(response);
-}
+  return res.status(500).json({
+    status: 'error',
+    message: 'Something went wrong. Please try again later.',
+  });
+};
 
 /**
- * Async route handler wrapper.
- * Wraps async route handlers to automatically catch rejected promises
- * and forward them to the centralized error handler.
- *
- * @param {Function} fn - Async route handler function
- * @returns {import('express').RequestHandler}
- *
- * @example
- * router.get('/', asyncHandler(async (req, res) => {
- *   const data = await someAsyncOperation();
- *   res.json({ success: true, data });
- * }));
+ * Global error handling middleware
+ * Must be registered LAST in Express middleware chain (4 parameters)
+ * @param {Error} err - Error object
+ * @param {Object} req - Express request
+ * @param {Object} res - Express response
+ * @param {Function} next - Express next function
  */
-function asyncHandler(fn) {
-  return (req, res, next) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
-  };
-}
+const errorHandler = (err, req, res, next) => {
+  // Set defaults
+  err.statusCode = err.statusCode || 500;
+  err.status = err.status || 'error';
 
-module.exports = { notFoundHandler, errorHandler, asyncHandler };
+  if (process.env.NODE_ENV === 'development') {
+    sendErrorDev(err, req, res);
+  } else {
+    let error = Object.assign(Object.create(Object.getPrototypeOf(err)), err);
+    error.message = err.message;
+
+    // Transform known error types into AppErrors
+    if (error.name === 'CastError') error = handleCastErrorDB(error);
+    if (error.code === 11000) error = handleDuplicateFieldsDB(error);
+    if (error.name === 'ValidationError') error = handleValidationErrorDB(error);
+    if (error.name === 'JsonWebTokenError') error = handleJWTError();
+    if (error.name === 'TokenExpiredError') error = handleJWTExpiredError();
+    if (error.name === 'MulterError') error = handleMulterError(error);
+
+    sendErrorProd(error, req, res);
+  }
+};
+
+/**
+ * 404 Not Found handler
+ * Catches requests to undefined routes
+ */
+const notFoundHandler = (req, res, next) => {
+  next(new AppError(`Route ${req.originalUrl} not found on this server.`, 404));
+};
+
+module.exports = { errorHandler, notFoundHandler };

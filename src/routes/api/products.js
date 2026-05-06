@@ -1,84 +1,71 @@
 /**
  * Product Routes
- * Defines API endpoints for product management including image upload support.
+ * GET    /api/products        - List products (public, with filters)
+ * GET    /api/products/:id    - Get product by ID (public)
+ * POST   /api/products        - Create product (admin only)
+ * PUT    /api/products/:id    - Update product (admin only)
+ * DELETE /api/products/:id    - Delete product (admin only)
  */
-
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../../middleware/auth');
-const {
-  handleSingleImageUpload,
-  handleMultipleImagesUpload,
-} = require('../../services/upload');
-const { validateUploadedFile, validateUploadedFiles } = require('../../middleware/uploadValidation');
-const {
-  getProducts,
-  getProductById,
-  createProduct,
-  updateProduct,
-  deleteProduct,
-} = require('../../controllers/productCtrl');
+const productCtrl = require('../../controllers/productCtrl');
+const { protect, restrictTo } = require('../../middleware/auth');
+const { validate, schemas } = require('../../middleware/validation');
+const { upload } = require('../../services/upload');
 
 /**
  * @route   GET /api/products
- * @desc    Get all products, optionally filtered by teamId
+ * @desc    List all products with optional filtering and pagination
  * @access  Public
- * @query   teamId - Filter products by team
- * @query   page - Page number (default: 1)
- * @query   limit - Items per page (default: 20)
- * @returns { products: [], total, page, pages }
  */
-router.get('/', getProducts);
+router.get('/', validate(schemas.getProductsQuery, 'query'), productCtrl.getProducts);
 
 /**
  * @route   GET /api/products/:id
  * @desc    Get a single product by ID
  * @access  Public
- * @param   id - MongoDB ObjectId of the product
- * @returns { product }
  */
-router.get('/:id', getProductById);
+router.get('/:id', validate(schemas.objectIdParam, 'params'), productCtrl.getProductById);
 
 /**
  * @route   POST /api/products
  * @desc    Create a new product with optional image upload
- * @access  Protected (requires JWT)
- * @body    multipart/form-data or application/json
- *          Required: name, teamId, price, category
- *          Optional: image (file), description, sizes, customization options
- * @returns { product }
+ * @access  Admin only
  */
 router.post(
   '/',
-  authenticate,
-  handleSingleImageUpload,
-  validateUploadedFile,
-  createProduct
+  protect,
+  restrictTo('admin'),
+  upload.single('image'),
+  validate(schemas.createProduct),
+  productCtrl.createProduct
 );
 
 /**
  * @route   PUT /api/products/:id
- * @desc    Update a product with optional image upload
- * @access  Protected (requires JWT)
- * @param   id - MongoDB ObjectId of the product
- * @body    multipart/form-data or application/json
- * @returns { product }
+ * @desc    Update an existing product
+ * @access  Admin only
  */
 router.put(
   '/:id',
-  authenticate,
-  handleSingleImageUpload,
-  validateUploadedFile,
-  updateProduct
+  protect,
+  restrictTo('admin'),
+  validate(schemas.objectIdParam, 'params'),
+  upload.single('image'),
+  productCtrl.updateProduct
 );
 
 /**
  * @route   DELETE /api/products/:id
  * @desc    Delete a product
- * @access  Protected (requires JWT)
- * @param   id - MongoDB ObjectId of the product
- * @returns { message }
+ * @access  Admin only
  */
-router.delete('/:id', authenticate, deleteProduct);
+router.delete(
+  '/:id',
+  protect,
+  restrictTo('admin'),
+  validate(schemas.objectIdParam, 'params'),
+  productCtrl.deleteProduct
+);
 
 module.exports = router;

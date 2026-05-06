@@ -1,80 +1,57 @@
 /**
- * Logger Utility
- *
- * Winston-based logger configured for both development (colorized console)
- * and production (JSON file + console) environments.
- *
- * Log levels: error > warn > info > http > verbose > debug > silly
+ * Winston Logger Configuration
+ * Provides structured logging with different transports for development and production.
+ * - Development: colorized console output
+ * - Production: JSON format to stdout + error file
  */
-
-'use strict';
-
-const winston = require('winston');
+const { createLogger, format, transports } = require('winston');
 const path = require('path');
-const fs = require('fs');
 
-// Ensure logs directory exists
-const logsDir = path.join(process.cwd(), 'logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
+const { combine, timestamp, printf, colorize, errors, json } = format;
 
-/** Custom log format for development: colorized, human-readable */
-const devFormat = winston.format.combine(
-  winston.format.colorize({ all: true }),
-  winston.format.timestamp({ format: 'HH:mm:ss' }),
-  winston.format.printf(({ timestamp, level, message, ...meta }) => {
-    const metaStr = Object.keys(meta).length ? `\n${JSON.stringify(meta, null, 2)}` : '';
-    return `[${timestamp}] ${level}: ${message}${metaStr}`;
-  })
-);
+// Custom log format for development (human-readable)
+const devFormat = printf(({ level, message, timestamp, stack, ...meta }) => {
+  const metaStr = Object.keys(meta).length ? `\n${JSON.stringify(meta, null, 2)}` : '';
+  return `${timestamp} [${level}]: ${stack || message}${metaStr}`;
+});
 
-/** Custom log format for production: structured JSON */
-const prodFormat = winston.format.combine(
-  winston.format.timestamp(),
-  winston.format.errors({ stack: true }),
-  winston.format.json()
-);
+// Create logger instance
+const logger = createLogger({
+  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
+  defaultMeta: { service: 'ballers-backend' },
+  transports: [],
+});
 
-/** Determine active log level based on environment */
-const logLevel = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
-
-/** Winston transports array */
-const transports = [
-  // Always log to console
-  new winston.transports.Console({
-    format: process.env.NODE_ENV === 'production' ? prodFormat : devFormat,
-  }),
-];
-
-// In production, also write to log files
 if (process.env.NODE_ENV === 'production') {
-  transports.push(
-    // Combined log (all levels)
-    new winston.transports.File({
-      filename: path.join(logsDir, 'combined.log'),
-      format: prodFormat,
-      maxsize: 10 * 1024 * 1024, // 10MB
-      maxFiles: 5,
-      tailable: true,
-    }),
-    // Error-only log
-    new winston.transports.File({
-      filename: path.join(logsDir, 'error.log'),
+  // Production: JSON format for log aggregation services
+  logger.add(
+    new transports.Console({
+      format: combine(timestamp(), errors({ stack: true }), json()),
+    })
+  );
+
+  // Also write errors to a file in production
+  logger.add(
+    new transports.File({
+      filename: path.join(process.cwd(), 'logs', 'error.log'),
       level: 'error',
-      format: prodFormat,
-      maxsize: 10 * 1024 * 1024, // 10MB
+      format: combine(timestamp(), errors({ stack: true }), json()),
+      maxsize: 5 * 1024 * 1024, // 5MB
       maxFiles: 5,
-      tailable: true,
+    })
+  );
+} else {
+  // Development: colorized, human-readable output
+  logger.add(
+    new transports.Console({
+      format: combine(
+        colorize({ all: true }),
+        timestamp({ format: 'HH:mm:ss' }),
+        errors({ stack: true }),
+        devFormat
+      ),
     })
   );
 }
-
-/** The configured Winston logger instance */
-const logger = winston.createLogger({
-  level: logLevel,
-  transports,
-  exitOnError: false,
-});
 
 module.exports = logger;

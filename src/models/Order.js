@@ -1,145 +1,126 @@
 /**
  * Order Model
- *
- * Represents a completed purchase by a user.
- * Stores a snapshot of the ordered items (including customization),
- * shipping address, masked payment info, and pricing breakdown.
+ * Represents a completed purchase order.
+ * Stores a snapshot of product data at time of purchase.
  */
-
 const mongoose = require('mongoose');
+const { VALID_SIZES, ORDER_STATUSES, PAYMENT_METHODS } = require('../utils/constants');
 
-// ---------------------------------------------------------------------------
-// Sub-schemas
-// ---------------------------------------------------------------------------
-
-/** Snapshot of a single ordered item */
 const orderItemSchema = new mongoose.Schema(
   {
     product: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Product',
-      required: true,
     },
-    /** Denormalised product name (preserved even if product is deleted) */
-    name: { type: String, required: true, trim: true },
-    /** URL of the primary product image at time of purchase */
-    image: { type: String, default: '' },
-    /** Unit price at time of purchase */
-    price: { type: Number, required: true, min: 0 },
-    quantity: { type: Number, required: true, min: 1, default: 1 },
+    name: {
+      type: String,
+      required: [true, 'Product name snapshot is required'],
+    },
+    price: {
+      type: Number,
+      required: [true, 'Price snapshot is required'],
+      min: [0, 'Price cannot be negative'],
+    },
+    quantity: {
+      type: Number,
+      required: [true, 'Quantity is required'],
+      min: [1, 'Quantity must be at least 1'],
+    },
     customization: {
-      playerName: { type: String, trim: true, default: '' },
-      playerNumber: { type: String, trim: true, default: '' },
-      size: {
-        type: String,
-        enum: ['XS', 'S', 'M', 'L', 'XL', 'XXL'],
-        default: 'M',
-      },
+      size: { type: String, enum: VALID_SIZES },
+      playerName: { type: String, default: '' },
+      playerNumber: { type: Number, default: null },
     },
   },
   { _id: false }
 );
 
-/** Shipping address snapshot */
 const shippingAddressSchema = new mongoose.Schema(
   {
     firstName: { type: String, required: true, trim: true },
     lastName: { type: String, required: true, trim: true },
-    email: { type: String, required: true, trim: true, lowercase: true },
+    email: { type: String, required: true, lowercase: true, trim: true },
     address: { type: String, required: true, trim: true },
     city: { type: String, required: true, trim: true },
-    zip: { type: String, required: true, trim: true },
+    postalCode: { type: String, required: true, trim: true },
     country: { type: String, required: true, trim: true },
-    phone: { type: String, trim: true, default: '' },
+    phone: { type: String, trim: true },
   },
   { _id: false }
 );
-
-/** Masked payment info (no sensitive data stored) */
-const paymentInfoSchema = new mongoose.Schema(
-  {
-    method: {
-      type: String,
-      enum: ['card', 'paypal'],
-      default: 'card',
-    },
-    /** Last 4 digits of the card number */
-    last4: { type: String, default: '' },
-    cardHolder: { type: String, trim: true, default: '' },
-  },
-  { _id: false }
-);
-
-// ---------------------------------------------------------------------------
-// Main Order schema
-// ---------------------------------------------------------------------------
 
 const orderSchema = new mongoose.Schema(
   {
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
-      index: true,
+      required: [true, 'User reference is required'],
+    },
+    orderNumber: {
+      type: String,
+      unique: true,
     },
     items: {
       type: [orderItemSchema],
       validate: {
-        validator: (v) => Array.isArray(v) && v.length > 0,
-        message: 'An order must contain at least one item.',
+        validator: (arr) => arr.length > 0,
+        message: 'Order must contain at least one item',
       },
     },
-    shippingAddress: { type: shippingAddressSchema, required: true },
-    paymentInfo: { type: paymentInfoSchema, required: true },
-
-    /** Pricing breakdown */
-    subtotal: { type: Number, required: true, min: 0 },
-    shippingCost: { type: Number, required: true, min: 0, default: 0 },
-    taxAmount: { type: Number, required: true, min: 0, default: 0 },
-    totalAmount: { type: Number, required: true, min: 0 },
-
-    /**
-     * Order lifecycle status.
-     * pending   -> confirmed -> processing -> shipped -> delivered
-     *                                                 -> cancelled
-     */
+    shippingAddress: {
+      type: shippingAddressSchema,
+      required: [true, 'Shipping address is required'],
+    },
+    paymentMethod: {
+      type: String,
+      enum: PAYMENT_METHODS,
+      default: 'card',
+    },
     status: {
       type: String,
-      enum: ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'],
+      enum: ORDER_STATUSES,
       default: 'pending',
-      index: true,
     },
-
-    /** Optional tracking number provided after shipment */
-    trackingNumber: { type: String, trim: true, default: '' },
-
-    /** Admin notes (internal use) */
-    notes: { type: String, trim: true, default: '' },
+    subtotal: {
+      type: Number,
+      required: true,
+      min: [0, 'Subtotal cannot be negative'],
+    },
+    shippingCost: {
+      type: Number,
+      default: 0,
+      min: [0, 'Shipping cost cannot be negative'],
+    },
+    total: {
+      type: Number,
+      required: true,
+      min: [0, 'Total cannot be negative'],
+    },
+    notes: {
+      type: String,
+      trim: true,
+      maxlength: [500, 'Notes cannot exceed 500 characters'],
+    },
   },
   {
-    timestamps: true, // adds createdAt and updatedAt
-    versionKey: false,
+    timestamps: true,
+    toJSON: { virtuals: true, transform: (doc, ret) => { delete ret.__v; return ret; } },
   }
 );
 
-// ---------------------------------------------------------------------------
-// Indexes
-// ---------------------------------------------------------------------------
-
-// Compound index for efficient user order history queries
-orderSchema.index({ user: 1, createdAt: -1 });
-
-// ---------------------------------------------------------------------------
-// Virtuals
-// ---------------------------------------------------------------------------
-
-/** Human-readable order reference (e.g. ORD-507f1f77bcf86cd799439011) */
-orderSchema.virtual('orderRef').get(function () {
-  return `ORD-${this._id}`;
+// Auto-generate order number before saving
+orderSchema.pre('save', async function (next) {
+  if (!this.orderNumber) {
+    const timestamp = Date.now().toString(36).toUpperCase();
+    const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+    this.orderNumber = `BLR-${timestamp}-${random}`;
+  }
+  next();
 });
 
-// ---------------------------------------------------------------------------
-// Export
-// ---------------------------------------------------------------------------
+// Indexes for common query patterns
+orderSchema.index({ user: 1, createdAt: -1 });
+orderSchema.index({ orderNumber: 1 });
+orderSchema.index({ status: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);

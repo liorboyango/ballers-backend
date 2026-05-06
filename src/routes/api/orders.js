@@ -1,76 +1,38 @@
 /**
- * Orders Router
- * All routes are protected – a valid JWT is required.
- *
- * POST /api/orders/create  – Place a new order from the user's cart
- * GET  /api/orders         – List the authenticated user's orders (paginated)
- * GET  /api/orders/:id     – Get a single order by ID
+ * Order Routes
+ * All order routes require authentication.
+ * POST /api/orders/create  - Create order from cart
+ * GET  /api/orders         - Get user's order history
+ * GET  /api/orders/:id     - Get specific order
  */
-
 const express = require('express');
 const router = express.Router();
-const auth = require('../../middleware/auth');
-const { createOrder, getOrders, getOrderById } = require('../../controllers/orderCtrl');
+const orderCtrl = require('../../controllers/orderCtrl');
+const { protect } = require('../../middleware/auth');
+const { validate, schemas } = require('../../middleware/validation');
+
+// All order routes require authentication
+router.use(protect);
 
 /**
- * @route  POST /api/orders/create
- * @desc   Create a new order from the authenticated user's cart
- * @access Private (JWT required)
- *
- * Request body:
- * {
- *   shippingAddress: {
- *     firstName, lastName, email, address, city, zip, country, phone?
- *   },
- *   paymentInfo: {
- *     method: 'card' | 'paypal',
- *     cardNumber?,   // only last 4 digits are stored
- *     cardHolder?,
- *     expiryMonth?,
- *     expiryYear?
- *   }
- * }
- *
- * Response 201:
- * {
- *   message: 'Order placed successfully',
- *   order: { id, status, items, shippingAddress, paymentInfo, subtotal,
- *            shippingCost, taxAmount, totalAmount, createdAt }
- * }
+ * @route   POST /api/orders/create
+ * @desc    Create a new order from the user's cart
+ * @access  Protected
  */
-router.post('/create', auth, createOrder);
+router.post('/create', validate(schemas.createOrder), orderCtrl.createOrder);
 
 /**
- * @route  GET /api/orders
- * @desc   Get paginated order history for the authenticated user
- * @access Private (JWT required)
- *
- * Query params:
- *   page  {number} – page number (default: 1)
- *   limit {number} – items per page (default: 10, max: 50)
- *
- * Response 200:
- * {
- *   orders: [ { id, status, items, shippingAddress, paymentInfo,
- *               subtotal, shippingCost, taxAmount, totalAmount,
- *               createdAt, updatedAt } ],
- *   pagination: { total, page, limit, totalPages, hasNextPage, hasPrevPage }
- * }
+ * @route   GET /api/orders
+ * @desc    Get all orders for the authenticated user
+ * @access  Protected
  */
-router.get('/', auth, getOrders);
+router.get('/', validate(schemas.getOrdersQuery, 'query'), orderCtrl.getOrders);
 
 /**
- * @route  GET /api/orders/:id
- * @desc   Get a single order by ID (must belong to the authenticated user)
- * @access Private (JWT required)
- *
- * Response 200:
- * {
- *   order: { id, status, items, shippingAddress, paymentInfo,
- *            subtotal, shippingCost, taxAmount, totalAmount,
- *            createdAt, updatedAt }
- * }
+ * @route   GET /api/orders/:id
+ * @desc    Get a specific order by ID
+ * @access  Protected
  */
-router.get('/:id', auth, getOrderById);
+router.get('/:id', validate(schemas.objectIdParam, 'params'), orderCtrl.getOrderById);
 
 module.exports = router;

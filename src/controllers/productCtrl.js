@@ -1,385 +1,222 @@
 /**
  * Product Controller
- * Handles CRUD operations for products including image upload support.
+ * Handles CRUD operations for products (soccer kits).
+ * Public endpoints: list, get by ID.
+ * Protected endpoints: create, update, delete (admin only).
  */
-
 const Product = require('../models/Product');
-const { getFileUrl, deleteUploadedFile } = require('../services/upload');
+const Team = require('../models/Team');
+const AppError = require('../utils/AppError');
+const asyncHandler = require('../utils/asyncHandler');
 const logger = require('../utils/logger');
-const path = require('path');
+const { PAGINATION } = require('../utils/constants');
 
 /**
- * Get all products with optional filtering and pagination
  * GET /api/products
- *
- * @param {Object} req - Express request
- * @param {Object} res - Express response
+ * List products with optional filtering, sorting, and pagination
+ * @query {string} [teamId] - Filter by team MongoDB ObjectId
+ * @query {string} [kitType] - Filter by kit type (home/away/third/goalkeeper)
+ * @query {number} [minPrice] - Minimum price filter
+ * @query {number} [maxPrice] - Maximum price filter
+ * @query {string} [size] - Filter by available size
+ * @query {string} [search] - Text search on name/description
+ * @query {number} [page=1] - Page number
+ * @query {number} [limit=20] - Items per page
+ * @query {string} [sort] - Sort field (prefix with - for descending)
  */
-const getProducts = async (req, res) => {
-  try {
-    const { teamId, category, minPrice, maxPrice, page = 1, limit = 20 } = req.query;
+exports.getProducts = asyncHandler(async (req, res, next) => {
+  const {
+    teamId,
+    kitType,
+    minPrice,
+    maxPrice,
+    size,
+    search,
+    page = PAGINATION.DEFAULT_PAGE,
+    limit = PAGINATION.DEFAULT_LIMIT,
+    sort,
+  } = req.query;
 
-    // Build filter query
-    const filter = {};
-    if (teamId) filter.teamId = teamId;
-    if (category) filter.category = category;
-    if (minPrice || maxPrice) {
-      filter.price = {};
-      if (minPrice) filter.price.$gte = parseFloat(minPrice);
-      if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
-    }
+  // Build filter object
+  const filter = {};
 
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
-    const skip = (pageNum - 1) * limitNum;
+  if (teamId) filter.team = teamId;
+  if (kitType) filter.kitType = kitType;
+  if (size) filter.sizes = { $in: [size] };
 
-    const [products, total] = await Promise.all([
-      Product.find(filter)
-        .populate('teamId', 'name country flag')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
-      Product.countDocuments(filter),
-    ]);
+  if (minPrice !== undefined || maxPrice !== undefined) {
+    filter.price = {};
+    if (minPrice !== undefined) filter.price.$gte = Number(minPrice);
+    if (maxPrice !== undefined) filter.price.$lte = Number(maxPrice);
+  }
 
-    return res.status(200).json({
-      products,
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: 'i' } },
+      { description: { $regex: search, $options: 'i' } },
+    ];
+  }
+
+  // Build sort object
+  let sortObj = { createdAt: -1 }; // Default: newest first
+  if (sort) {
+    const sortField = sort.startsWith('-') ? sort.slice(1) : sort;
+    const sortOrder = sort.startsWith('-') ? -1 : 1;
+    sortObj = { [sortField]: sortOrder };
+  }
+
+  // Pagination
+  const pageNum = parseInt(page, 10);
+  const limitNum = parseInt(limit, 10);
+  const skip = (pageNum - 1) * limitNum;
+
+  // Execute query with population
+  const [products, total] = await Promise.all([
+    Product.find(filter)
+      .populate('team', 'name country flagUrl')
+      .sort(sortObj)
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+    Product.countDocuments(filter),
+  ]);
+
+  res.status(200).json({
+    status: 'success',
+    results: products.length,
+    pagination: {
       total,
       page: pageNum,
-      pages: Math.ceil(total / limitNum),
       limit: limitNum,
-    });
-  } catch (error) {
-    logger.error('Error fetching products:', error);
-    return res.status(500).json({
-      error: 'Failed to fetch products.',
-      code: 'FETCH_FAILED',
-    });
-  }
-};
+      totalPages: Math.ceil(total / limitNum),
+      hasNextPage: pageNum < Math.ceil(total / limitNum),
+      hasPrevPage: pageNum > 1,
+    },
+    data: products,
+  });
+});
 
 /**
- * Get a single product by ID
  * GET /api/products/:id
- *
- * @param {Object} req - Express request
- * @param {Object} res - Express response
+ * Get a single product by ID
+ * @param {string} id - MongoDB ObjectId of the product
  */
-const getProductById = async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id)
-      .populate('teamId', 'name country flag')
-      .lean();
+exports.getProductById = asyncHandler(async (req, res, next) => {
+  const product = await Product.findById(req.params.id)
+    .populate('team', 'name country flagUrl group')
+    .lean();
 
-    if (!product) {
-      return res.status(404).json({
-        error: 'Product not found.',
-        code: 'NOT_FOUND',
-      });
-    }
-
-    return res.status(200).json({ product });
-  } catch (error) {
-    logger.error('Error fetching product:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({
-        error: 'Invalid product ID.',
-        code: 'INVALID_ID',
-      });
-    }
-    return res.status(500).json({
-      error: 'Failed to fetch product.',
-      code: 'FETCH_FAILED',
-    });
+  if (!product) {
+    return next(new AppError('Product not found.', 404));
   }
-};
+
+  res.status(200).json({
+    status: 'success',
+    data: product,
+  });
+});
 
 /**
- * Create a new product
  * POST /api/products
- * Supports multipart/form-data for image upload
- *
- * @param {Object} req - Express request (may contain req.file from Multer)
- * @param {Object} res - Express response
+ * Create a new product (admin only)
+ * Requires multipart/form-data for image upload
+ * @body {string} name - Product name
+ * @body {number} price - Product price
+ * @body {string} teamId - Team MongoDB ObjectId
+ * @body {string} kitType - Kit type (home/away/third/goalkeeper)
+ * @body {string[]} sizes - Available sizes array
+ * @file {File} [image] - Product image (max 5MB, JPEG/PNG/WebP)
  */
-const createProduct = async (req, res) => {
-  try {
-    const {
-      name,
-      teamId,
-      price,
-      description,
-      category,
-      sizes,
-      customization,
-      sponsor,
-      inStock,
-    } = req.body;
-
-    // Basic required field validation
-    if (!name || !teamId || !price || !category) {
-      // Clean up uploaded file if validation fails
-      if (req.file) {
-        await deleteUploadedFile(req.file.filename).catch(() => {});
-      }
-      return res.status(400).json({
-        error: 'Missing required fields: name, teamId, price, category.',
-        code: 'MISSING_FIELDS',
-      });
-    }
-
-    // Build product data
-    const productData = {
-      name,
-      teamId,
-      price: parseFloat(price),
-      description: description || '',
-      category,
-      inStock: inStock !== undefined ? inStock === 'true' || inStock === true : true,
-    };
-
-    // Handle sizes (can be JSON string or array)
-    if (sizes) {
-      try {
-        productData.sizes = typeof sizes === 'string' ? JSON.parse(sizes) : sizes;
-      } catch {
-        productData.sizes = Array.isArray(sizes) ? sizes : [sizes];
-      }
-    }
-
-    // Handle customization options (can be JSON string or object)
-    if (customization) {
-      try {
-        productData.customization =
-          typeof customization === 'string' ? JSON.parse(customization) : customization;
-      } catch {
-        // Ignore invalid customization JSON
-      }
-    }
-
-    // Handle sponsor
-    if (sponsor) productData.sponsor = sponsor;
-
-    // Handle uploaded image
-    if (req.file) {
-      const imageUrl = getFileUrl(req.file.filename);
-      productData.imageUrl = imageUrl;
-      productData.images = [imageUrl];
-    }
-
-    const product = new Product(productData);
-    await product.save();
-    await product.populate('teamId', 'name country flag');
-
-    logger.info(`Product created: ${product._id} - ${product.name}`);
-
-    return res.status(201).json({
-      message: 'Product created successfully.',
-      product,
-    });
-  } catch (error) {
-    // Clean up uploaded file on error
-    if (req.file) {
-      await deleteUploadedFile(req.file.filename).catch(() => {});
-    }
-    logger.error('Error creating product:', error);
-    if (error.name === 'ValidationError') {
-      return res.status(400).json({
-        error: Object.values(error.errors)
-          .map((e) => e.message)
-          .join(', '),
-        code: 'VALIDATION_ERROR',
-      });
-    }
-    return res.status(500).json({
-      error: 'Failed to create product.',
-      code: 'CREATE_FAILED',
-    });
+exports.createProduct = asyncHandler(async (req, res, next) => {
+  // Verify team exists
+  const team = await Team.findById(req.body.teamId);
+  if (!team) {
+    return next(new AppError('Team not found. Please provide a valid teamId.', 404));
   }
-};
+
+  // Build product data
+  const productData = {
+    ...req.body,
+    team: req.body.teamId,
+  };
+  delete productData.teamId;
+
+  // Attach uploaded image URL if present
+  if (req.file) {
+    productData.imageUrl = `/uploads/${req.file.filename}`;
+  }
+
+  const product = await Product.create(productData);
+  await product.populate('team', 'name country flagUrl');
+
+  logger.info(`Product created: ${product.name} (${product._id})`);
+
+  res.status(201).json({
+    status: 'success',
+    message: 'Product created successfully.',
+    data: product,
+  });
+});
 
 /**
- * Update an existing product
  * PUT /api/products/:id
- * Supports multipart/form-data for image upload
- *
- * @param {Object} req - Express request (may contain req.file from Multer)
- * @param {Object} res - Express response
+ * Update an existing product (admin only)
+ * @param {string} id - MongoDB ObjectId of the product
  */
-const updateProduct = async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id);
+exports.updateProduct = asyncHandler(async (req, res, next) => {
+  const updateData = { ...req.body };
 
-    if (!product) {
-      // Clean up uploaded file if product not found
-      if (req.file) {
-        await deleteUploadedFile(req.file.filename).catch(() => {});
-      }
-      return res.status(404).json({
-        error: 'Product not found.',
-        code: 'NOT_FOUND',
-      });
+  // Handle teamId -> team field mapping
+  if (updateData.teamId) {
+    const team = await Team.findById(updateData.teamId);
+    if (!team) {
+      return next(new AppError('Team not found. Please provide a valid teamId.', 404));
     }
-
-    const {
-      name,
-      teamId,
-      price,
-      description,
-      category,
-      sizes,
-      customization,
-      sponsor,
-      inStock,
-      removeImage,
-    } = req.body;
-
-    // Update fields if provided
-    if (name !== undefined) product.name = name;
-    if (teamId !== undefined) product.teamId = teamId;
-    if (price !== undefined) product.price = parseFloat(price);
-    if (description !== undefined) product.description = description;
-    if (category !== undefined) product.category = category;
-    if (inStock !== undefined) product.inStock = inStock === 'true' || inStock === true;
-    if (sponsor !== undefined) product.sponsor = sponsor;
-
-    // Handle sizes update
-    if (sizes !== undefined) {
-      try {
-        product.sizes = typeof sizes === 'string' ? JSON.parse(sizes) : sizes;
-      } catch {
-        product.sizes = Array.isArray(sizes) ? sizes : [sizes];
-      }
-    }
-
-    // Handle customization update
-    if (customization !== undefined) {
-      try {
-        product.customization =
-          typeof customization === 'string' ? JSON.parse(customization) : customization;
-      } catch {
-        // Ignore invalid customization JSON
-      }
-    }
-
-    // Handle image update
-    if (req.file) {
-      // Delete old primary image if it exists and is a local upload
-      if (product.imageUrl && product.imageUrl.startsWith('/uploads/')) {
-        const oldFilename = path.basename(product.imageUrl);
-        await deleteUploadedFile(oldFilename).catch(() => {});
-        // Remove old image from images array
-        product.images = product.images.filter((img) => img !== product.imageUrl);
-      }
-
-      const newImageUrl = getFileUrl(req.file.filename);
-      product.imageUrl = newImageUrl;
-      if (!product.images.includes(newImageUrl)) {
-        product.images.push(newImageUrl);
-      }
-    } else if (removeImage === 'true' || removeImage === true) {
-      // Remove primary image if requested
-      if (product.imageUrl && product.imageUrl.startsWith('/uploads/')) {
-        const oldFilename = path.basename(product.imageUrl);
-        await deleteUploadedFile(oldFilename).catch(() => {});
-        product.images = product.images.filter((img) => img !== product.imageUrl);
-      }
-      product.imageUrl = undefined;
-    }
-
-    await product.save();
-    await product.populate('teamId', 'name country flag');
-
-    logger.info(`Product updated: ${product._id} - ${product.name}`);
-
-    return res.status(200).json({
-      message: 'Product updated successfully.',
-      product,
-    });
-  } catch (error) {
-    // Clean up uploaded file on error
-    if (req.file) {
-      await deleteUploadedFile(req.file.filename).catch(() => {});
-    }
-    logger.error('Error updating product:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({
-        error: 'Invalid product ID.',
-        code: 'INVALID_ID',
-      });
-    }
-    if (error.name === 'ValidationError') {
-      return res.status(400).json({
-        error: Object.values(error.errors)
-          .map((e) => e.message)
-          .join(', '),
-        code: 'VALIDATION_ERROR',
-      });
-    }
-    return res.status(500).json({
-      error: 'Failed to update product.',
-      code: 'UPDATE_FAILED',
-    });
+    updateData.team = updateData.teamId;
+    delete updateData.teamId;
   }
-};
+
+  // Attach new image if uploaded
+  if (req.file) {
+    updateData.imageUrl = `/uploads/${req.file.filename}`;
+  }
+
+  const product = await Product.findByIdAndUpdate(
+    req.params.id,
+    updateData,
+    { new: true, runValidators: true }
+  ).populate('team', 'name country flagUrl');
+
+  if (!product) {
+    return next(new AppError('Product not found.', 404));
+  }
+
+  logger.info(`Product updated: ${product._id}`);
+
+  res.status(200).json({
+    status: 'success',
+    message: 'Product updated successfully.',
+    data: product,
+  });
+});
 
 /**
- * Delete a product
  * DELETE /api/products/:id
- *
- * @param {Object} req - Express request
- * @param {Object} res - Express response
+ * Delete a product (admin only)
+ * @param {string} id - MongoDB ObjectId of the product
  */
-const deleteProduct = async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id);
+exports.deleteProduct = asyncHandler(async (req, res, next) => {
+  const product = await Product.findByIdAndDelete(req.params.id);
 
-    if (!product) {
-      return res.status(404).json({
-        error: 'Product not found.',
-        code: 'NOT_FOUND',
-      });
-    }
-
-    // Delete all associated images from disk
-    const imagesToDelete = [...(product.images || [])];
-    if (product.imageUrl && !imagesToDelete.includes(product.imageUrl)) {
-      imagesToDelete.push(product.imageUrl);
-    }
-
-    await Promise.all(
-      imagesToDelete
-        .filter((img) => img && img.startsWith('/uploads/'))
-        .map((img) => deleteUploadedFile(path.basename(img)).catch(() => {}))
-    );
-
-    await Product.findByIdAndDelete(req.params.id);
-
-    logger.info(`Product deleted: ${req.params.id}`);
-
-    return res.status(200).json({
-      message: 'Product deleted successfully.',
-    });
-  } catch (error) {
-    logger.error('Error deleting product:', error);
-    if (error.name === 'CastError') {
-      return res.status(400).json({
-        error: 'Invalid product ID.',
-        code: 'INVALID_ID',
-      });
-    }
-    return res.status(500).json({
-      error: 'Failed to delete product.',
-      code: 'DELETE_FAILED',
-    });
+  if (!product) {
+    return next(new AppError('Product not found.', 404));
   }
-};
 
-module.exports = {
-  getProducts,
-  getProductById,
-  createProduct,
-  updateProduct,
-  deleteProduct,
-};
+  logger.info(`Product deleted: ${req.params.id}`);
+
+  res.status(204).json({
+    status: 'success',
+    message: 'Product deleted successfully.',
+    data: null,
+  });
+});

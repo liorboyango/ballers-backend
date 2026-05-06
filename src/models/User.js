@@ -1,13 +1,9 @@
 /**
  * User Model
- * Stores user accounts with hashed passwords.
- * Provides a comparePassword instance method for login.
+ * Represents a registered user account.
+ * Password field is excluded from queries by default (select: false).
  */
-
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-
-const SALT_ROUNDS = 12;
 
 const userSchema = new mongoose.Schema(
   {
@@ -16,7 +12,7 @@ const userSchema = new mongoose.Schema(
       required: [true, 'Name is required'],
       trim: true,
       minlength: [2, 'Name must be at least 2 characters'],
-      maxlength: [100, 'Name must not exceed 100 characters'],
+      maxlength: [50, 'Name cannot exceed 50 characters'],
     },
     email: {
       type: String,
@@ -30,7 +26,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, 'Password is required'],
       minlength: [8, 'Password must be at least 8 characters'],
-      select: false, // Never return password in queries by default
+      select: false, // Never return password in queries
     },
     role: {
       type: String,
@@ -43,10 +39,10 @@ const userSchema = new mongoose.Schema(
     },
   },
   {
-    timestamps: true,
+    timestamps: true, // Adds createdAt and updatedAt
     toJSON: {
-      transform(doc, ret) {
-        delete ret.password;
+      transform: (doc, ret) => {
+        delete ret.password; // Extra safety: never serialize password
         delete ret.__v;
         return ret;
       },
@@ -54,33 +50,7 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-// ─── Indexes ──────────────────────────────────────────────────────────────────
-userSchema.index({ email: 1 }, { unique: true });
+// Index for fast email lookups
+userSchema.index({ email: 1 });
 
-// ─── Pre-save Hook: Hash Password ─────────────────────────────────────────────
-userSchema.pre('save', async function hashPassword(next) {
-  // Only hash if the password field was modified
-  if (!this.isModified('password')) return next();
-
-  try {
-    const salt = await bcrypt.genSalt(SALT_ROUNDS);
-    this.password = await bcrypt.hash(this.password, salt);
-    next();
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ─── Instance Method: Compare Password ───────────────────────────────────────
-/**
- * Compare a plain-text password against the stored hash.
- * @param {string} candidatePassword - Plain-text password from login form
- * @returns {Promise<boolean>} True if passwords match
- */
-userSchema.methods.comparePassword = async function comparePassword(candidatePassword) {
-  return bcrypt.compare(candidatePassword, this.password);
-};
-
-const User = mongoose.model('User', userSchema);
-
-module.exports = User;
+module.exports = mongoose.model('User', userSchema);

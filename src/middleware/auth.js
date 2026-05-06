@@ -1,98 +1,80 @@
 /**
  * JWT Authentication Middleware
- * Verifies the Bearer token from the Authorization header
- * and attaches the decoded user payload to req.user.
+ * Verifies the JWT token from the Authorization header.
+ * Attaches the decoded user payload to req.user for downstream handlers.
  */
-
 const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+const AppError = require('../utils/AppError');
+const asyncHandler = require('../utils/asyncHandler');
 
 /**
- * protect - Middleware to guard routes that require authentication.
- *
- * Expects: Authorization: Bearer <token>
- * On success: sets req.user = { id, email, role }
- * On failure: responds with 401
+ * Protect middleware - requires valid JWT token
+ * Extracts token from: Authorization: Bearer <token>
  */
-const protect = (req, res, next) => {
+exports.protect = asyncHandler(async (req, res, next) => {
+  // 1. Extract token from header
+  let token;
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    return next(
+      new AppError('Authentication required. Please log in to access this resource.', 401)
+    );
+  }
+
+  // 2. Verify token signature and expiry
+  let decoded;
   try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required. Please provide a valid token.',
-      });
-    }
-
-    const token = authHeader.split(' ')[1];
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication token is missing.',
-      });
-    }
-
-    // Verify token signature and expiry
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
-      issuer: 'ballers-api',
-      audience: 'ballers-client',
-    });
-
-    // Attach user info to request
-    req.user = {
-      id: decoded.id,
-      email: decoded.email,
-      role: decoded.role,
-    };
-
-    next();
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        success: false,
-        error: 'Your session has expired. Please log in again.',
-      });
+      return next(new AppError('Your session has expired. Please log in again.', 401));
     }
-    if (err.name === 'JsonWebTokenError') {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid authentication token.',
-      });
-    }
-    // Unexpected error
-    return res.status(401).json({
-      success: false,
-      error: 'Authentication failed.',
-    });
+    return next(new AppError('Invalid authentication token. Please log in again.', 401));
   }
-};
+
+  // 3. Check if user still exists
+  const user = await User.findById(decoded.id).select('-password');
+  if (!user) {
+    return next(
+      new AppError('The user associated with this token no longer exists.', 401)
+    );
+  }
+
+  // 4. Check if account is active
+  if (user.isActive === false) {
+    return next(
+      new AppError('Your account has been deactivated. Please contact support.', 403)
+    );
+  }
+
+  // 5. Attach user to request
+  req.user = user;
+  next();
+});
 
 /**
- * requireRole - Middleware factory to restrict access by user role.
- * Must be used AFTER protect middleware.
- *
+ * Role-based authorization middleware
+ * Must be used AFTER protect middleware
  * @param {...string} roles - Allowed roles (e.g., 'admin', 'user')
- * @returns Express middleware
+ * @returns {Function} Express middleware
  *
- * Usage: router.delete('/product/:id', protect, requireRole('admin'), deleteProduct)
+ * @example
+ * router.delete('/products/:id', protect, restrictTo('admin'), deleteProduct);
  */
-const requireRole = (...roles) => (req, res, next) => {
-  if (!req.user) {
-    return res.status(401).json({
-      success: false,
-      error: 'Authentication required.',
-    });
-  }
-
-  if (!roles.includes(req.user.role)) {
-    return res.status(403).json({
-      success: false,
-      error: `Access denied. Required role: ${roles.join(' or ')}.`,
-    });
-  }
-
-  next();
+exports.restrictTo = (...roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return next(
+        new AppError(
+          `Access denied. This action requires ${roles.join(' or ')} privileges.`,
+          403
+        )
+      );
+    }
+    next();
+  };
 };
-
-module.exports = { protect, requireRole };

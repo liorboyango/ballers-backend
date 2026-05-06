@@ -1,44 +1,24 @@
 /**
  * Application Constants
- *
- * Centralized constants used across the backend application.
- * Avoids magic numbers/strings scattered throughout the codebase.
+ * Centralized location for all magic numbers, strings, and configuration values.
  */
 
-'use strict';
+/** Valid jersey/kit sizes */
+const VALID_SIZES = ['XS', 'S', 'M', 'L', 'XL', 'XXL'];
 
-/** Rate limiting configuration */
-const RATE_LIMIT = {
-  /** Time window in milliseconds (1 minute) */
-  WINDOW_MS: 60 * 1000,
-  /** Maximum requests per window per IP */
-  MAX_REQUESTS: 100,
-  /** Stricter limit for auth endpoints */
-  AUTH_MAX_REQUESTS: 10,
-};
+/** Valid kit types */
+const KIT_TYPES = ['home', 'away', 'third', 'goalkeeper'];
+
+/** Valid order statuses */
+const ORDER_STATUSES = ['pending', 'processing', 'shipped', 'delivered', 'cancelled'];
+
+/** Valid payment methods */
+const PAYMENT_METHODS = ['card', 'paypal', 'stripe'];
 
 /** JWT configuration */
-const JWT = {
-  /** Token expiry duration */
-  EXPIRES_IN: '24h',
-  /** Refresh token expiry */
-  REFRESH_EXPIRES_IN: '7d',
-};
-
-/** Bcrypt configuration */
-const BCRYPT = {
-  /** Salt rounds for password hashing (12 is a good balance of security/performance) */
-  SALT_ROUNDS: 12,
-};
-
-/** File upload configuration */
-const UPLOAD = {
-  /** Maximum file size in bytes (5MB) */
-  MAX_FILE_SIZE: 5 * 1024 * 1024,
-  /** Allowed MIME types for product images */
-  ALLOWED_MIME_TYPES: ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'],
-  /** Upload destination directory */
-  DEST: 'uploads/',
+const JWT_CONFIG = {
+  EXPIRY: '24h',
+  REFRESH_EXPIRY: '7d',
 };
 
 /** Pagination defaults */
@@ -48,35 +28,21 @@ const PAGINATION = {
   MAX_LIMIT: 100,
 };
 
-/** User roles */
-const USER_ROLES = {
-  USER: 'user',
-  ADMIN: 'admin',
+/** File upload limits */
+const UPLOAD_LIMITS = {
+  MAX_FILE_SIZE: 5 * 1024 * 1024, // 5MB in bytes
+  ALLOWED_MIME_TYPES: ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'],
+  ALLOWED_EXTENSIONS: ['.jpg', '.jpeg', '.png', '.webp'],
 };
 
-/** Order statuses */
-const ORDER_STATUS = {
-  PENDING: 'pending',
-  CONFIRMED: 'confirmed',
-  PROCESSING: 'processing',
-  SHIPPED: 'shipped',
-  DELIVERED: 'delivered',
-  CANCELLED: 'cancelled',
-  REFUNDED: 'refunded',
+/** Rate limiting */
+const RATE_LIMIT = {
+  WINDOW_MS: 60 * 1000, // 1 minute
+  MAX_REQUESTS: 100,
+  AUTH_MAX_REQUESTS: 10, // Stricter limit for auth endpoints
 };
 
-/** Product kit types */
-const KIT_TYPE = {
-  HOME: 'home',
-  AWAY: 'away',
-  THIRD: 'third',
-  GOALKEEPER: 'goalkeeper',
-};
-
-/** Available shirt sizes */
-const SHIRT_SIZES = ['XS', 'S', 'M', 'L', 'XL', 'XXL'];
-
-/** HTTP status codes (commonly used) */
+/** HTTP Status Codes (for readability) */
 const HTTP_STATUS = {
   OK: 200,
   CREATED: 201,
@@ -89,18 +55,16 @@ const HTTP_STATUS = {
   UNPROCESSABLE_ENTITY: 422,
   TOO_MANY_REQUESTS: 429,
   INTERNAL_SERVER_ERROR: 500,
-  NOT_IMPLEMENTED: 501,
 };
 
 module.exports = {
-  RATE_LIMIT,
-  JWT,
-  BCRYPT,
-  UPLOAD,
+  VALID_SIZES,
+  KIT_TYPES,
+  ORDER_STATUSES,
+  PAYMENT_METHODS,
+  JWT_CONFIG,
   PAGINATION,
-  USER_ROLES,
-  ORDER_STATUS,
-  KIT_TYPE,
-  SHIRT_SIZES,
+  UPLOAD_LIMITS,
+  RATE_LIMIT,
   HTTP_STATUS,
 };

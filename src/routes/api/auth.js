@@ -1,39 +1,34 @@
 /**
- * Auth Routes
- * POST /api/auth/register  - Create a new user account
- * POST /api/auth/login     - Authenticate and receive JWT
- * GET  /api/auth/me        - Get current user profile (protected)
+ * Authentication Routes
+ * POST /api/auth/register - Register new user
+ * POST /api/auth/login    - Login and get JWT
+ * GET  /api/auth/me       - Get current user profile (protected)
  */
-
 const express = require('express');
 const router = express.Router();
-const { register, login, getMe } = require('../../controllers/authCtrl');
+const authCtrl = require('../../controllers/authCtrl');
 const { protect } = require('../../middleware/auth');
+const { validate, schemas } = require('../../middleware/validation');
 
 /**
  * @route   POST /api/auth/register
- * @desc    Register a new user
+ * @desc    Register a new user account
  * @access  Public
- * @body    { name: string, email: string, password: string }
- * @returns { success, message, token, user }
  */
-router.post('/register', register);
+router.post('/register', validate(schemas.register), authCtrl.register);
 
 /**
  * @route   POST /api/auth/login
- * @desc    Login and receive JWT
+ * @desc    Authenticate user and return JWT token
  * @access  Public
- * @body    { email: string, password: string }
- * @returns { success, message, token, user }
  */
-router.post('/login', login);
+router.post('/login', validate(schemas.login), authCtrl.login);
 
 /**
  * @route   GET /api/auth/me
- * @desc    Get current authenticated user
- * @access  Protected (JWT required)
- * @returns { success, user }
+ * @desc    Get current authenticated user's profile
+ * @access  Protected
  */
-router.get('/me', protect, getMe);
+router.get('/me', protect, authCtrl.getMe);
 
 module.exports = router;
