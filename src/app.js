@@ -1,0 +1,168 @@
+/**
+ * Ballers Backend - Express Application Factory
+ *
+ * Creates and configures the Express app with all middleware
+ * and route registrations. Exported separately from index.js
+ * to allow clean testing without starting the HTTP server.
+ */
+
+'use strict';
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const path = require('path');
+
+const { errorHandler, notFoundHandler } = require('./middleware/error');
+const logger = require('./utils/logger');
+const { RATE_LIMIT } = require('./utils/constants');
+
+const app = express();
+
+// ─── Security Middleware ─────────────────────────────────────────────────────
+
+/**
+ * Helmet sets various HTTP headers to protect against common web vulnerabilities.
+ * Configured to allow serving static files from /uploads.
+ */
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow cross-origin image loading
+  })
+);
+
+/**
+ * CORS configuration.
+ * In production, only the configured FRONTEND_URL is allowed.
+ * In development, localhost:3000 is also permitted.
+ */
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g., mobile apps, curl, Postman)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      logger.warn(`CORS blocked request from origin: ${origin}`);
+      return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// ─── Rate Limiting ───────────────────────────────────────────────────────────
+
+/**
+ * Global rate limiter: 100 requests per minute per IP.
+ * Stricter limits are applied per-route for auth endpoints.
+ */
+const globalLimiter = rateLimit({
+  windowMs: RATE_LIMIT.WINDOW_MS,
+  max: RATE_LIMIT.MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: 'Too many requests from this IP, please try again later.',
+  },
+  handler: (req, res, next, options) => {
+    logger.warn(`Rate limit exceeded for IP: ${req.ip}`);
+    res.status(options.statusCode).json(options.message);
+  },
+});
+
+app.use(globalLimiter);
+
+// ─── Request Parsing ─────────────────────────────────────────────────────────
+
+/** Parse incoming JSON payloads (max 10mb for base64 image previews) */
+app.use(express.json({ limit: '10mb' }));
+
+/** Parse URL-encoded form data */
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ─── Compression ─────────────────────────────────────────────────────────────
+
+/** Gzip/Brotli compress all responses */
+app.use(compression());
+
+// ─── HTTP Request Logging ────────────────────────────────────────────────────
+
+/**
+ * Morgan HTTP request logger.
+ * Uses 'combined' format in production for full log entries,
+ * 'dev' format in development for concise colored output.
+ * Streams to Winston logger.
+ */
+app.use(
+  morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
+    stream: {
+      write: (message) => logger.http(message.trim()),
+    },
+    skip: (req) => req.url === '/health', // Skip health check logs
+  })
+);
+
+// ─── Static Files ────────────────────────────────────────────────────────────
+
+/**
+ * Serve uploaded product images from /uploads directory.
+ * Files are stored here by Multer (configured in services/upload.js).
+ */
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+
+// ─── Health Check ────────────────────────────────────────────────────────────
+
+/**
+ * @route   GET /health
+ * @desc    Health check endpoint for load balancers and monitoring
+ * @access  Public
+ */
+app.get('/health', (req, res) => {
+  const mongoose = require('mongoose');
+  const dbStatus = mongoose.connection.readyState;
+  const dbStatusMap = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+
+  res.status(200).json({
+    success: true,
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    database: dbStatusMap[dbStatus] || 'unknown',
+    uptime: process.uptime(),
+  });
+});
+
+// ─── API Routes ──────────────────────────────────────────────────────────────
+
+/**
+ * Mount all API route modules under /api prefix.
+ * Routes are registered here; implementations live in src/routes/api/.
+ */
+app.use('/api/auth', require('./routes/api/auth'));
+app.use('/api/teams', require('./routes/api/teams'));
+app.use('/api/products', require('./routes/api/products'));
+app.use('/api/cart', require('./routes/api/cart'));
+app.use('/api/orders', require('./routes/api/orders'));
+
+// ─── Error Handling ──────────────────────────────────────────────────────────
+
+/** 404 handler for unmatched routes */
+app.use(notFoundHandler);
+
+/** Centralized error handler - must be last middleware */
+app.use(errorHandler);
+
+module.exports = app;
