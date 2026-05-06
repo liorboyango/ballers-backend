@@ -1,75 +1,103 @@
 /**
  * Cart Controller
  * Manages shopping cart operations for authenticated users.
- * Cart is stored in MongoDB and linked to the user's account.
+ * The cart is stored as a single Firestore document keyed by user id.
+ *
+ * Each item carries a uuid `id` so that update/remove flows can target it
+ * (Firestore arrays don't get per-element ids automatically).
  */
+const crypto = require('crypto');
+const { admin } = require('../services/db');
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
+const Team = require('../models/Team');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 const logger = require('../utils/logger');
 
-/**
- * GET /api/cart
- * Retrieve the current user's cart with populated product details
- */
-exports.getCart = asyncHandler(async (req, res, next) => {
-  let cart = await Cart.findOne({ user: req.user.id })
-    .populate({
-      path: 'items.product',
-      select: 'name price imageUrl team kitType sizes stock',
-      populate: { path: 'team', select: 'name country flagUrl' },
-    })
-    .lean();
+const PRODUCT_FIELDS_FULL = ['name', 'price', 'imageUrl', 'team', 'kitType', 'sizes', 'stock'];
+const PRODUCT_FIELDS_SHORT = ['name', 'price', 'imageUrl', 'team', 'kitType'];
+const TEAM_FIELDS_FULL = ['name', 'country', 'flagUrl'];
+const TEAM_FIELDS_SHORT = ['name', 'country'];
 
-  if (!cart) {
-    // Return empty cart structure if none exists
-    return res.status(200).json({
-      status: 'success',
-      data: {
-        items: [],
-        subtotal: 0,
-        itemCount: 0,
-      },
-    });
+const pick = (obj, fields) => {
+  const out = {};
+  for (const f of fields) if (obj && obj[f] !== undefined) out[f] = obj[f];
+  return out;
+};
+
+const populateItems = async (items, productFields, teamFields) => {
+  if (!items || items.length === 0) return [];
+
+  const productIds = [...new Set(items.map((i) => i.product).filter(Boolean))];
+  if (productIds.length === 0) return items.map((i) => ({ ...i, product: null }));
+
+  const productSnaps = await admin
+    .firestore()
+    .getAll(...productIds.map((id) => Product.collection().doc(id)));
+  const productById = new Map();
+  for (const s of productSnaps) {
+    if (s.exists) productById.set(s.id, { id: s.id, ...s.data() });
   }
 
-  // Calculate totals
-  const subtotal = cart.items.reduce((sum, item) => {
-    const price = item.product ? item.product.price : 0;
-    return sum + price * item.quantity;
-  }, 0);
+  const teamIds = [...new Set([...productById.values()].map((p) => p.team).filter(Boolean))];
+  const teamById = new Map();
+  if (teamIds.length > 0) {
+    const teamSnaps = await admin
+      .firestore()
+      .getAll(...teamIds.map((id) => Team.collection().doc(id)));
+    for (const s of teamSnaps) {
+      if (s.exists) teamById.set(s.id, { id: s.id, ...s.data() });
+    }
+  }
 
-  const itemCount = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+  return items.map((item) => {
+    const p = productById.get(item.product);
+    if (!p) return { ...item, product: null };
+    const productView = { id: p.id, ...pick(p, productFields) };
+    if (productView.team) {
+      const team = teamById.get(productView.team);
+      productView.team = team ? { id: team.id, ...pick(team, teamFields) } : null;
+    }
+    return { ...item, product: productView };
+  });
+};
+
+const buildEmptyCart = () => ({ items: [], subtotal: 0, itemCount: 0 });
+
+exports.getCart = asyncHandler(async (req, res, next) => {
+  const snap = await Cart.docForUser(req.user.id).get();
+  if (!snap.exists) {
+    return res.status(200).json({ status: 'success', data: buildEmptyCart() });
+  }
+
+  const cart = Cart.serialize(snap);
+  const items = await populateItems(cart.items || [], PRODUCT_FIELDS_FULL, TEAM_FIELDS_FULL);
+  const subtotal = items.reduce(
+    (sum, it) => sum + (it.product ? it.product.price : 0) * it.quantity,
+    0
+  );
+  const itemCount = items.reduce((sum, it) => sum + it.quantity, 0);
 
   res.status(200).json({
     status: 'success',
     data: {
       ...cart,
+      items,
       subtotal: Math.round(subtotal * 100) / 100,
       itemCount,
     },
   });
 });
 
-/**
- * POST /api/cart/add
- * Add a product to the cart or increase quantity if already present
- * @body {string} productId - MongoDB ObjectId of the product
- * @body {number} [quantity=1] - Quantity to add (1-10)
- * @body {Object} customization - Customization options
- * @body {string} customization.size - Required size selection
- * @body {string} [customization.playerName] - Optional player name
- * @body {number} [customization.playerNumber] - Optional player number (1-99)
- */
 exports.addToCart = asyncHandler(async (req, res, next) => {
   const { productId, quantity = 1, customization } = req.body;
 
-  // Verify product exists and is in stock
-  const product = await Product.findById(productId);
-  if (!product) {
+  const productSnap = await Product.collection().doc(productId).get();
+  if (!productSnap.exists) {
     return next(new AppError('Product not found.', 404));
   }
+  const product = Product.serialize(productSnap);
 
   if (product.stock !== undefined && product.stock < quantity) {
     return next(
@@ -80,7 +108,6 @@ exports.addToCart = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Validate size is available for this product
   if (!product.sizes.includes(customization.size)) {
     return next(
       new AppError(
@@ -90,51 +117,53 @@ exports.addToCart = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Find or create cart
-  let cart = await Cart.findOne({ user: req.user.id });
-  if (!cart) {
-    cart = new Cart({ user: req.user.id, items: [] });
-  }
+  const ref = Cart.docForUser(req.user.id);
+  const now = admin.firestore.FieldValue.serverTimestamp();
 
-  // Check if same product+customization already in cart
-  const existingItemIndex = cart.items.findIndex(
+  const cartSnap = await ref.get();
+  const existingItems = cartSnap.exists ? cartSnap.data().items || [] : [];
+
+  const matchIndex = existingItems.findIndex(
     (item) =>
-      item.product.toString() === productId &&
+      item.product === productId &&
       item.customization.size === customization.size &&
       item.customization.playerName === (customization.playerName || '') &&
       item.customization.playerNumber === (customization.playerNumber || null)
   );
 
-  if (existingItemIndex > -1) {
-    // Update quantity of existing item
-    const newQuantity = cart.items[existingItemIndex].quantity + quantity;
+  let items;
+  if (matchIndex > -1) {
+    const newQuantity = existingItems[matchIndex].quantity + quantity;
     if (newQuantity > 10) {
       return next(new AppError('Maximum quantity per item is 10.', 400));
     }
-    cart.items[existingItemIndex].quantity = newQuantity;
+    items = existingItems.map((it, idx) =>
+      idx === matchIndex ? { ...it, quantity: newQuantity } : it
+    );
   } else {
-    // Add new item
-    cart.items.push({
-      product: productId,
-      quantity,
-      customization: {
-        size: customization.size,
-        playerName: customization.playerName || '',
-        playerNumber: customization.playerNumber || null,
+    items = [
+      ...existingItems,
+      {
+        id: crypto.randomUUID(),
+        product: productId,
+        quantity,
+        customization: {
+          size: customization.size,
+          playerName: customization.playerName || '',
+          playerNumber: customization.playerNumber || null,
+        },
       },
-    });
+    ];
   }
 
-  await cart.save();
+  if (cartSnap.exists) {
+    await ref.update({ items, updatedAt: now });
+  } else {
+    await ref.set({ user: req.user.id, items, createdAt: now, updatedAt: now });
+  }
 
-  // Return populated cart
-  await cart.populate({
-    path: 'items.product',
-    select: 'name price imageUrl team kitType',
-    populate: { path: 'team', select: 'name country' },
-  });
-
-  const itemCount = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+  const populated = await populateItems(items, PRODUCT_FIELDS_SHORT, TEAM_FIELDS_SHORT);
+  const itemCount = populated.reduce((sum, it) => sum + it.quantity, 0);
 
   logger.info(`Item added to cart for user ${req.user.id}: product ${productId}`);
 
@@ -142,80 +171,70 @@ exports.addToCart = asyncHandler(async (req, res, next) => {
     status: 'success',
     message: 'Item added to cart.',
     data: {
-      ...cart.toObject(),
+      id: req.user.id,
+      user: req.user.id,
+      items: populated,
       itemCount,
     },
   });
 });
 
-/**
- * PUT /api/cart/update
- * Update the quantity of a specific cart item
- * @body {string} itemId - MongoDB ObjectId of the cart item
- * @body {number} quantity - New quantity (1-10)
- */
 exports.updateCartItem = asyncHandler(async (req, res, next) => {
   const { itemId, quantity } = req.body;
 
-  const cart = await Cart.findOne({ user: req.user.id });
-  if (!cart) {
+  const ref = Cart.docForUser(req.user.id);
+  const cartSnap = await ref.get();
+  if (!cartSnap.exists) {
     return next(new AppError('Cart not found.', 404));
   }
 
-  const itemIndex = cart.items.findIndex(
-    (item) => item._id.toString() === itemId
-  );
-
-  if (itemIndex === -1) {
+  const existingItems = cartSnap.data().items || [];
+  const idx = existingItems.findIndex((it) => it.id === itemId);
+  if (idx === -1) {
     return next(new AppError('Cart item not found.', 404));
   }
 
-  cart.items[itemIndex].quantity = quantity;
-  await cart.save();
+  const items = existingItems.map((it, i) =>
+    i === idx ? { ...it, quantity } : it
+  );
+  await ref.update({ items, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-  await cart.populate({
-    path: 'items.product',
-    select: 'name price imageUrl team kitType',
-    populate: { path: 'team', select: 'name country' },
-  });
-
-  const subtotal = cart.items.reduce((sum, item) => {
-    const price = item.product ? item.product.price : 0;
-    return sum + price * item.quantity;
-  }, 0);
+  const populated = await populateItems(items, PRODUCT_FIELDS_SHORT, TEAM_FIELDS_SHORT);
+  const subtotal = populated.reduce(
+    (sum, it) => sum + (it.product ? it.product.price : 0) * it.quantity,
+    0
+  );
+  const itemCount = populated.reduce((sum, it) => sum + it.quantity, 0);
 
   res.status(200).json({
     status: 'success',
     message: 'Cart updated.',
     data: {
-      ...cart.toObject(),
+      id: req.user.id,
+      user: req.user.id,
+      items: populated,
       subtotal: Math.round(subtotal * 100) / 100,
-      itemCount: cart.items.reduce((sum, item) => sum + item.quantity, 0),
+      itemCount,
     },
   });
 });
 
-/**
- * DELETE /api/cart/item
- * Remove a specific item from the cart
- * @query {string} itemId - MongoDB ObjectId of the cart item to remove
- */
 exports.removeCartItem = asyncHandler(async (req, res, next) => {
   const { itemId } = req.query;
 
-  const cart = await Cart.findOne({ user: req.user.id });
-  if (!cart) {
+  const ref = Cart.docForUser(req.user.id);
+  const cartSnap = await ref.get();
+  if (!cartSnap.exists) {
     return next(new AppError('Cart not found.', 404));
   }
 
-  const initialLength = cart.items.length;
-  cart.items = cart.items.filter((item) => item._id.toString() !== itemId);
-
-  if (cart.items.length === initialLength) {
+  const existingItems = cartSnap.data().items || [];
+  const items = existingItems.filter((it) => it.id !== itemId);
+  if (items.length === existingItems.length) {
     return next(new AppError('Cart item not found.', 404));
   }
 
-  await cart.save();
+  await ref.update({ items, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
   logger.info(`Item ${itemId} removed from cart for user ${req.user.id}`);
 
@@ -223,26 +242,22 @@ exports.removeCartItem = asyncHandler(async (req, res, next) => {
     status: 'success',
     message: 'Item removed from cart.',
     data: {
-      itemCount: cart.items.reduce((sum, item) => sum + item.quantity, 0),
+      itemCount: items.reduce((sum, it) => sum + it.quantity, 0),
     },
   });
 });
 
-/**
- * DELETE /api/cart
- * Clear all items from the cart
- */
 exports.clearCart = asyncHandler(async (req, res, next) => {
-  const cart = await Cart.findOne({ user: req.user.id });
-  if (!cart) {
+  const ref = Cart.docForUser(req.user.id);
+  const cartSnap = await ref.get();
+  if (!cartSnap.exists) {
     return res.status(200).json({
       status: 'success',
       message: 'Cart is already empty.',
     });
   }
 
-  cart.items = [];
-  await cart.save();
+  await ref.update({ items: [], updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
   res.status(200).json({
     status: 'success',

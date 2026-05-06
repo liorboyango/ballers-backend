@@ -13,8 +13,8 @@
  */
 const REQUIRED_ENV_VARS = [
   {
-    name: 'MONGO_URI',
-    description: 'MongoDB connection string (e.g., mongodb+srv://user:pass@cluster.mongodb.net/ballers)',
+    name: 'FIREBASE_SERVICE_ACCOUNT',
+    description: 'Firebase service-account JSON (raw or base64-encoded)',
   },
   {
     name: 'JWT_SECRET',

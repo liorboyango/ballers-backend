@@ -1,6 +1,6 @@
 /**
  * Ballers Backend - Main Entry Point
- * Express server with MongoDB connection, middleware stack, and API routes.
+ * Express server with Firestore connection, middleware stack, and API routes.
  * Security: helmet, CORS, rate-limiting, JWT auth, input validation.
  */
 require('dotenv').config();
@@ -10,7 +10,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 
 const connectDB = require('./services/db');
 const logger = require('./utils/logger');
@@ -21,7 +20,7 @@ const { RATE_LIMIT } = require('./utils/constants');
 // ─────────────────────────────────────────────
 // ENVIRONMENT VALIDATION
 // ─────────────────────────────────────────────
-const REQUIRED_ENV_VARS = ['MONGO_URI', 'JWT_SECRET'];
+const REQUIRED_ENV_VARS = ['FIREBASE_SERVICE_ACCOUNT', 'JWT_SECRET'];
 const missingVars = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
 if (missingVars.length > 0) {
   logger.error(`Missing required environment variables: ${missingVars.join(', ')}`);
@@ -38,12 +37,10 @@ const PORT = process.env.PORT || 5000;
 // SECURITY MIDDLEWARE
 // ─────────────────────────────────────────────
 
-// Set security HTTP headers
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow serving uploaded images
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
-// CORS configuration
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:3000',
   'https://ballers-app.onrender.com',
@@ -51,7 +48,6 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
@@ -63,7 +59,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// Global rate limiter (100 requests per minute per IP)
 const globalLimiter = rateLimit({
   windowMs: RATE_LIMIT.WINDOW_MS,
   max: RATE_LIMIT.MAX_REQUESTS,
@@ -75,7 +70,6 @@ const globalLimiter = rateLimit({
   },
 });
 
-// Stricter rate limiter for auth endpoints (10 requests per minute)
 const authLimiter = rateLimit({
   windowMs: RATE_LIMIT.WINDOW_MS,
   max: RATE_LIMIT.AUTH_MAX_REQUESTS,
@@ -94,20 +88,10 @@ app.use('/api/auth/', authLimiter);
 // GENERAL MIDDLEWARE
 // ─────────────────────────────────────────────
 
-// HTTP request logging
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-
-// Parse JSON bodies (limit 10kb to prevent large payload attacks)
 app.use(express.json({ limit: '10kb' }));
-
-// Parse URL-encoded bodies
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
-
-// Sanitize all incoming request data (XSS protection)
 app.use(sanitizeInput);
-
-// Serve uploaded files statically
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // ─────────────────────────────────────────────
 // API ROUTES
@@ -118,7 +102,6 @@ app.use('/api/products', require('./routes/api/products'));
 app.use('/api/cart', require('./routes/api/cart'));
 app.use('/api/orders', require('./routes/api/orders'));
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -131,11 +114,7 @@ app.get('/health', (req, res) => {
 // ─────────────────────────────────────────────
 // ERROR HANDLING (must be LAST)
 // ─────────────────────────────────────────────
-
-// 404 handler for undefined routes
 app.use(notFoundHandler);
-
-// Global error handler
 app.use(errorHandler);
 
 // ─────────────────────────────────────────────
@@ -153,14 +132,11 @@ const startServer = async () => {
   }
 };
 
-// Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Promise Rejection:', { reason, promise });
-  // Graceful shutdown
   process.exit(1);
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught Exception:', err);
   process.exit(1);
@@ -168,4 +144,4 @@ process.on('uncaughtException', (err) => {
 
 startServer();
 
-module.exports = app; // Export for testing
+module.exports = app;

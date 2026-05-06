@@ -100,10 +100,10 @@ const createProductSchema = Joi.object({
     'any.required': 'Price is required',
   }),
   teamId: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .pattern(/^[A-Za-z0-9_-]{1,128}$/)
     .required()
     .messages({
-      'string.pattern.base': 'teamId must be a valid MongoDB ObjectId',
+      'string.pattern.base': 'teamId must be a valid identifier',
       'any.required': 'teamId is required',
     }),
   kitType: Joi.string().valid('home', 'away', 'third', 'goalkeeper').required().messages({
@@ -131,10 +131,10 @@ const createProductSchema = Joi.object({
  */
 const getProductsQuerySchema = Joi.object({
   teamId: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .pattern(/^[A-Za-z0-9_-]{1,128}$/)
     .optional()
     .messages({
-      'string.pattern.base': 'teamId must be a valid MongoDB ObjectId',
+      'string.pattern.base': 'teamId must be a valid identifier',
     }),
   kitType: Joi.string().valid('home', 'away', 'third', 'goalkeeper').optional(),
   minPrice: Joi.number().min(0).optional(),
@@ -147,14 +147,14 @@ const getProductsQuerySchema = Joi.object({
 });
 
 /**
- * Schema for MongoDB ObjectId URL params
+ * Schema for `:id` URL params (Firestore document id).
  */
 const objectIdParamSchema = Joi.object({
   id: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .pattern(/^[A-Za-z0-9_-]{1,128}$/)
     .required()
     .messages({
-      'string.pattern.base': 'id must be a valid MongoDB ObjectId',
+      'string.pattern.base': 'id must be a valid identifier',
       'any.required': 'id parameter is required',
     }),
 });
@@ -185,10 +185,10 @@ const customizationSchema = Joi.object({
  */
 const addToCartSchema = Joi.object({
   productId: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .pattern(/^[A-Za-z0-9_-]{1,128}$/)
     .required()
     .messages({
-      'string.pattern.base': 'productId must be a valid MongoDB ObjectId',
+      'string.pattern.base': 'productId must be a valid identifier',
       'any.required': 'productId is required',
     }),
   quantity: Joi.number().integer().min(1).max(10).default(1).messages({
@@ -205,10 +205,10 @@ const addToCartSchema = Joi.object({
  */
 const updateCartSchema = Joi.object({
   itemId: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .min(1)
+    .max(128)
     .required()
     .messages({
-      'string.pattern.base': 'itemId must be a valid MongoDB ObjectId',
       'any.required': 'itemId is required',
     }),
   quantity: Joi.number().integer().min(1).max(10).required().messages({
@@ -223,10 +223,10 @@ const updateCartSchema = Joi.object({
  */
 const removeCartItemSchema = Joi.object({
   itemId: Joi.string()
-    .pattern(/^[a-fA-F0-9]{24}$/)
+    .min(1)
+    .max(128)
     .required()
     .messages({
-      'string.pattern.base': 'itemId must be a valid MongoDB ObjectId',
       'any.required': 'itemId query parameter is required',
     }),
 });

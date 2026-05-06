@@ -1,43 +1,17 @@
 /**
- * File Upload Service
- * Configures Multer for handling product image uploads.
- * Validates file type (JPEG/PNG/WebP only) and size (max 5MB).
- * Files are stored in /uploads directory with unique filenames.
+ * File upload service.
+ * Multer collects the file in-memory (no local disk writes); the buffer is
+ * then streamed to Firebase Storage and the controller stores the resulting
+ * public URL on the product document.
  */
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const crypto = require('crypto');
+const { admin } = require('./db');
 const AppError = require('../utils/AppError');
+const logger = require('../utils/logger');
 const { UPLOAD_LIMITS } = require('../utils/constants');
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-/**
- * Multer disk storage configuration
- * Files are saved to /uploads with timestamp-based unique names
- */
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    // Generate unique filename: timestamp-randomhex.ext
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `product-${uniqueSuffix}${ext}`);
-  },
-});
-
-/**
- * File type filter - only allow image files
- * @param {Object} req - Express request
- * @param {Object} file - Multer file object
- * @param {Function} cb - Callback
- */
 const fileFilter = (req, file, cb) => {
   if (UPLOAD_LIMITS.ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
@@ -52,17 +26,51 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-/**
- * Configured Multer instance
- * - Max file size: 5MB
- * - Allowed types: JPEG, PNG, WebP
- * - Storage: disk (/uploads directory)
- */
-exports.upload = multer({
-  storage,
+const upload = multer({
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: {
     fileSize: UPLOAD_LIMITS.MAX_FILE_SIZE,
-    files: 1, // Only one file per request
+    files: 1,
   },
 });
+
+const getBucket = () => admin.storage().bucket();
+
+/**
+ * Streams a file buffer to Firebase Storage under products/<uuid><ext> and
+ * returns a publicly readable URL. The product document stores this URL.
+ */
+const uploadProductImage = async ({ buffer, mimetype, originalname }) => {
+  const ext = path.extname(originalname || '').toLowerCase() || '';
+  const objectName = `products/${crypto.randomUUID()}${ext}`;
+  const file = getBucket().file(objectName);
+
+  await file.save(buffer, {
+    contentType: mimetype,
+    resumable: false,
+    metadata: { cacheControl: 'public, max-age=31536000' },
+  });
+  await file.makePublic();
+
+  return `https://storage.googleapis.com/${getBucket().name}/${objectName}`;
+};
+
+/**
+ * Best-effort deletion of a previously stored image. Accepts the public URL
+ * we wrote in `uploadProductImage`. Does not throw if the file is missing.
+ */
+const deleteProductImage = async (publicUrl) => {
+  if (!publicUrl) return;
+  const bucket = getBucket();
+  const prefix = `https://storage.googleapis.com/${bucket.name}/`;
+  if (!publicUrl.startsWith(prefix)) return;
+  const objectName = publicUrl.slice(prefix.length);
+  try {
+    await bucket.file(objectName).delete();
+  } catch (err) {
+    logger.warn(`Failed to delete storage object ${objectName}: ${err.message}`);
+  }
+};
+
+module.exports = { upload, uploadProductImage, deleteProductImage };

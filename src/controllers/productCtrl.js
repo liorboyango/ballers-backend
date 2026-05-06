@@ -3,7 +3,17 @@
  * Handles CRUD operations for products (soccer kits).
  * Public endpoints: list, get by ID.
  * Protected endpoints: create, update, delete (admin only).
+ *
+ * Notes on Firestore translation:
+ *  - `$or` and case-insensitive regex are not natively supported. The `search`
+ *    parameter is applied in-memory after the query.
+ *  - `populate('team', ...)` is replaced by an explicit follow-up read; for
+ *    list responses we batch reads via getAll().
+ *  - Product images are stored in Firebase Storage; `imageUrl` on the document
+ *    is the public URL we wrote in the upload service.
  */
+const { admin } = require('../services/db');
+const { uploadProductImage, deleteProductImage } = require('../services/upload');
 const Product = require('../models/Product');
 const Team = require('../models/Team');
 const AppError = require('../utils/AppError');
@@ -11,19 +21,29 @@ const asyncHandler = require('../utils/asyncHandler');
 const logger = require('../utils/logger');
 const { PAGINATION } = require('../utils/constants');
 
-/**
- * GET /api/products
- * List products with optional filtering, sorting, and pagination
- * @query {string} [teamId] - Filter by team MongoDB ObjectId
- * @query {string} [kitType] - Filter by kit type (home/away/third/goalkeeper)
- * @query {number} [minPrice] - Minimum price filter
- * @query {number} [maxPrice] - Maximum price filter
- * @query {string} [size] - Filter by available size
- * @query {string} [search] - Text search on name/description
- * @query {number} [page=1] - Page number
- * @query {number} [limit=20] - Items per page
- * @query {string} [sort] - Sort field (prefix with - for descending)
- */
+const TEAM_LIST_FIELDS = ['name', 'country', 'flagUrl'];
+const TEAM_DETAIL_FIELDS = ['name', 'country', 'flagUrl', 'group'];
+
+const pickFields = (obj, fields) => {
+  if (!obj) return null;
+  const out = { id: obj.id };
+  for (const f of fields) if (obj[f] !== undefined) out[f] = obj[f];
+  return out;
+};
+
+const attachTeams = async (products, fields) => {
+  const ids = [...new Set(products.map((p) => p.team).filter(Boolean))];
+  if (ids.length === 0) return products;
+
+  const refs = ids.map((id) => Team.collection().doc(id));
+  const snaps = await admin.firestore().getAll(...refs);
+  const byId = new Map();
+  for (const s of snaps) {
+    if (s.exists) byId.set(s.id, pickFields(Team.serialize(s), fields));
+  }
+  return products.map((p) => ({ ...p, team: byId.get(p.team) || null }));
+};
+
 exports.getProducts = asyncHandler(async (req, res, next) => {
   const {
     teamId,
@@ -37,49 +57,44 @@ exports.getProducts = asyncHandler(async (req, res, next) => {
     sort,
   } = req.query;
 
-  // Build filter object
-  const filter = {};
+  let query = Product.collection();
+  if (teamId) query = query.where('team', '==', teamId);
+  if (kitType) query = query.where('kitType', '==', kitType);
+  if (size) query = query.where('sizes', 'array-contains', size);
+  if (minPrice !== undefined) query = query.where('price', '>=', Number(minPrice));
+  if (maxPrice !== undefined) query = query.where('price', '<=', Number(maxPrice));
 
-  if (teamId) filter.team = teamId;
-  if (kitType) filter.kitType = kitType;
-  if (size) filter.sizes = { $in: [size] };
-
-  if (minPrice !== undefined || maxPrice !== undefined) {
-    filter.price = {};
-    if (minPrice !== undefined) filter.price.$gte = Number(minPrice);
-    if (maxPrice !== undefined) filter.price.$lte = Number(maxPrice);
+  let sortField = 'createdAt';
+  let sortDir = 'desc';
+  if (sort) {
+    sortField = sort.startsWith('-') ? sort.slice(1) : sort;
+    sortDir = sort.startsWith('-') ? 'desc' : 'asc';
   }
+  if (minPrice !== undefined || maxPrice !== undefined) {
+    query = query.orderBy('price', sortDir);
+    if (sortField !== 'price') query = query.orderBy(sortField, sortDir);
+  } else {
+    query = query.orderBy(sortField, sortDir);
+  }
+
+  let docs = (await query.get()).docs.map(Product.serialize);
 
   if (search) {
-    filter.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } },
-    ];
+    const needle = search.toLowerCase();
+    docs = docs.filter(
+      (p) =>
+        (p.name && p.name.toLowerCase().includes(needle)) ||
+        (p.description && p.description.toLowerCase().includes(needle))
+    );
   }
 
-  // Build sort object
-  let sortObj = { createdAt: -1 }; // Default: newest first
-  if (sort) {
-    const sortField = sort.startsWith('-') ? sort.slice(1) : sort;
-    const sortOrder = sort.startsWith('-') ? -1 : 1;
-    sortObj = { [sortField]: sortOrder };
-  }
-
-  // Pagination
+  const total = docs.length;
   const pageNum = parseInt(page, 10);
   const limitNum = parseInt(limit, 10);
   const skip = (pageNum - 1) * limitNum;
+  const pageDocs = docs.slice(skip, skip + limitNum);
 
-  // Execute query with population
-  const [products, total] = await Promise.all([
-    Product.find(filter)
-      .populate('team', 'name country flagUrl')
-      .sort(sortObj)
-      .skip(skip)
-      .limit(limitNum)
-      .lean(),
-    Product.countDocuments(filter),
-  ]);
+  const products = await attachTeams(pageDocs, TEAM_LIST_FIELDS);
 
   res.status(200).json({
     status: 'success',
@@ -96,121 +111,98 @@ exports.getProducts = asyncHandler(async (req, res, next) => {
   });
 });
 
-/**
- * GET /api/products/:id
- * Get a single product by ID
- * @param {string} id - MongoDB ObjectId of the product
- */
 exports.getProductById = asyncHandler(async (req, res, next) => {
-  const product = await Product.findById(req.params.id)
-    .populate('team', 'name country flagUrl group')
-    .lean();
-
-  if (!product) {
+  const snap = await Product.collection().doc(req.params.id).get();
+  if (!snap.exists) {
     return next(new AppError('Product not found.', 404));
   }
 
-  res.status(200).json({
-    status: 'success',
-    data: product,
-  });
+  const product = Product.serialize(snap);
+  const [withTeam] = await attachTeams([product], TEAM_DETAIL_FIELDS);
+
+  res.status(200).json({ status: 'success', data: withTeam });
 });
 
-/**
- * POST /api/products
- * Create a new product (admin only)
- * Requires multipart/form-data for image upload
- * @body {string} name - Product name
- * @body {number} price - Product price
- * @body {string} teamId - Team MongoDB ObjectId
- * @body {string} kitType - Kit type (home/away/third/goalkeeper)
- * @body {string[]} sizes - Available sizes array
- * @file {File} [image] - Product image (max 5MB, JPEG/PNG/WebP)
- */
 exports.createProduct = asyncHandler(async (req, res, next) => {
-  // Verify team exists
-  const team = await Team.findById(req.body.teamId);
-  if (!team) {
+  const teamSnap = await Team.collection().doc(req.body.teamId).get();
+  if (!teamSnap.exists) {
     return next(new AppError('Team not found. Please provide a valid teamId.', 404));
   }
 
-  // Build product data
+  const { teamId, ...rest } = req.body;
+  const now = admin.firestore.FieldValue.serverTimestamp();
   const productData = {
-    ...req.body,
-    team: req.body.teamId,
+    ...rest,
+    team: teamId,
+    createdAt: now,
+    updatedAt: now,
   };
-  delete productData.teamId;
+  if (req.file) productData.imageUrl = await uploadProductImage(req.file);
 
-  // Attach uploaded image URL if present
-  if (req.file) {
-    productData.imageUrl = `/uploads/${req.file.filename}`;
-  }
+  const ref = Product.collection().doc();
+  await ref.set(productData);
+  const snap = await ref.get();
+  const product = Product.serialize(snap);
+  const [withTeam] = await attachTeams([product], TEAM_LIST_FIELDS);
 
-  const product = await Product.create(productData);
-  await product.populate('team', 'name country flagUrl');
-
-  logger.info(`Product created: ${product.name} (${product._id})`);
+  logger.info(`Product created: ${product.name} (${product.id})`);
 
   res.status(201).json({
     status: 'success',
     message: 'Product created successfully.',
-    data: product,
+    data: withTeam,
   });
 });
 
-/**
- * PUT /api/products/:id
- * Update an existing product (admin only)
- * @param {string} id - MongoDB ObjectId of the product
- */
 exports.updateProduct = asyncHandler(async (req, res, next) => {
-  const updateData = { ...req.body };
+  const ref = Product.collection().doc(req.params.id);
+  const existing = await ref.get();
+  if (!existing.exists) {
+    return next(new AppError('Product not found.', 404));
+  }
 
-  // Handle teamId -> team field mapping
+  const updateData = { ...req.body };
   if (updateData.teamId) {
-    const team = await Team.findById(updateData.teamId);
-    if (!team) {
+    const teamSnap = await Team.collection().doc(updateData.teamId).get();
+    if (!teamSnap.exists) {
       return next(new AppError('Team not found. Please provide a valid teamId.', 404));
     }
     updateData.team = updateData.teamId;
     delete updateData.teamId;
   }
 
-  // Attach new image if uploaded
-  if (req.file) {
-    updateData.imageUrl = `/uploads/${req.file.filename}`;
+  const previousImageUrl = existing.data().imageUrl;
+  if (req.file) updateData.imageUrl = await uploadProductImage(req.file);
+  updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+  await ref.update(updateData);
+
+  if (req.file && previousImageUrl) {
+    await deleteProductImage(previousImageUrl);
   }
 
-  const product = await Product.findByIdAndUpdate(
-    req.params.id,
-    updateData,
-    { new: true, runValidators: true }
-  ).populate('team', 'name country flagUrl');
+  const snap = await ref.get();
+  const product = Product.serialize(snap);
+  const [withTeam] = await attachTeams([product], TEAM_LIST_FIELDS);
 
-  if (!product) {
-    return next(new AppError('Product not found.', 404));
-  }
-
-  logger.info(`Product updated: ${product._id}`);
+  logger.info(`Product updated: ${product.id}`);
 
   res.status(200).json({
     status: 'success',
     message: 'Product updated successfully.',
-    data: product,
+    data: withTeam,
   });
 });
 
-/**
- * DELETE /api/products/:id
- * Delete a product (admin only)
- * @param {string} id - MongoDB ObjectId of the product
- */
 exports.deleteProduct = asyncHandler(async (req, res, next) => {
-  const product = await Product.findByIdAndDelete(req.params.id);
-
-  if (!product) {
+  const ref = Product.collection().doc(req.params.id);
+  const snap = await ref.get();
+  if (!snap.exists) {
     return next(new AppError('Product not found.', 404));
   }
+  const imageUrl = snap.data().imageUrl;
+  await ref.delete();
+  if (imageUrl) await deleteProductImage(imageUrl);
 
   logger.info(`Product deleted: ${req.params.id}`);
 

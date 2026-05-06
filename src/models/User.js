@@ -1,56 +1,32 @@
 /**
- * User Model
- * Represents a registered user account.
- * Password field is excluded from queries by default (select: false).
+ * User collection accessor (Firestore).
+ * Documents shape:
+ *   { name, email, password, role, isActive, createdAt, updatedAt }
+ * Email uniqueness is enforced by query check at registration time.
  */
-const mongoose = require('mongoose');
+const { getDb } = require('../services/db');
 
-const userSchema = new mongoose.Schema(
-  {
-    name: {
-      type: String,
-      required: [true, 'Name is required'],
-      trim: true,
-      minlength: [2, 'Name must be at least 2 characters'],
-      maxlength: [50, 'Name cannot exceed 50 characters'],
-    },
-    email: {
-      type: String,
-      required: [true, 'Email is required'],
-      unique: true,
-      lowercase: true,
-      trim: true,
-      match: [/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'Please provide a valid email address'],
-    },
-    password: {
-      type: String,
-      required: [true, 'Password is required'],
-      minlength: [8, 'Password must be at least 8 characters'],
-      select: false, // Never return password in queries
-    },
-    role: {
-      type: String,
-      enum: ['user', 'admin'],
-      default: 'user',
-    },
-    isActive: {
-      type: Boolean,
-      default: true,
-    },
-  },
-  {
-    timestamps: true, // Adds createdAt and updatedAt
-    toJSON: {
-      transform: (doc, ret) => {
-        delete ret.password; // Extra safety: never serialize password
-        delete ret.__v;
-        return ret;
-      },
-    },
-  }
-);
+const COLLECTION = 'users';
 
-// Index for fast email lookups
-userSchema.index({ email: 1 });
+const collection = () => getDb().collection(COLLECTION);
 
-module.exports = mongoose.model('User', userSchema);
+const serialize = (snap) => {
+  if (!snap || !snap.exists) return null;
+  const data = snap.data();
+  return {
+    id: snap.id,
+    name: data.name,
+    email: data.email,
+    role: data.role,
+    isActive: data.isActive,
+    createdAt: data.createdAt,
+    updatedAt: data.updatedAt,
+  };
+};
+
+const serializeWithPassword = (snap) => {
+  if (!snap || !snap.exists) return null;
+  return { id: snap.id, ...snap.data() };
+};
+
+module.exports = { COLLECTION, collection, serialize, serializeWithPassword };

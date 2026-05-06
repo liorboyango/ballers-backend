@@ -59,7 +59,7 @@ router.delete('/:filename', authenticate, deleteProductImage);
  * @route   PUT /api/upload/attach/:productId
  * @desc    Attach an uploaded image to a product
  * @access  Protected (requires JWT)
- * @param   productId - MongoDB ObjectId of the product
+ * @param   productId - Firestore document id of the product
  * @body    { imageUrl: string, isPrimary?: boolean }
  * @returns { message, product: { _id, name, imageUrl, images } }
  */

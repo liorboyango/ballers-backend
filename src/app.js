@@ -14,7 +14,6 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 
 const { errorHandler, notFoundHandler } = require('./middleware/error');
 const logger = require('./utils/logger');
@@ -115,14 +114,6 @@ app.use(
   })
 );
 
-// ─── Static Files ────────────────────────────────────────────────────────────
-
-/**
- * Serve uploaded product images from /uploads directory.
- * Files are stored here by Multer (configured in services/upload.js).
- */
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
-
 // ─── Health Check ────────────────────────────────────────────────────────────
 
 /**
@@ -131,16 +122,15 @@ app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
  * @access  Public
  */
 app.get('/health', (req, res) => {
-  const mongoose = require('mongoose');
-  const dbStatus = mongoose.connection.readyState;
-  const dbStatusMap = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  const admin = require('firebase-admin');
+  const database = admin.apps.length > 0 ? 'connected' : 'disconnected';
 
   res.status(200).json({
     success: true,
     status: 'ok',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
-    database: dbStatusMap[dbStatus] || 'unknown',
+    database,
     uptime: process.uptime(),
   });
 });

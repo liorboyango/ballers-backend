@@ -2,7 +2,11 @@
  * Order Controller
  * Handles order creation and retrieval.
  * Orders are created from the user's current cart.
+ *
+ * createOrder runs in a Firestore transaction so that stock validation,
+ * order creation, and cart clearing are atomic.
  */
+const { admin, getDb } = require('../services/db');
 const Order = require('../models/Order');
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
@@ -10,85 +14,95 @@ const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 const logger = require('../utils/logger');
 
-/**
- * POST /api/orders/create
- * Create a new order from the user's current cart
- * @body {Object} shippingAddress - Delivery address details
- * @body {string} [paymentMethod='card'] - Payment method
- * @body {string} [notes] - Optional order notes
- */
 exports.createOrder = asyncHandler(async (req, res, next) => {
   const { shippingAddress, paymentMethod = 'card', notes } = req.body;
+  const db = getDb();
 
-  // Get user's cart with product details
-  const cart = await Cart.findOne({ user: req.user.id }).populate({
-    path: 'items.product',
-    select: 'name price stock team kitType',
+  const cartRef = Cart.docForUser(req.user.id);
+  const orderRef = Order.collection().doc();
+
+  const result = await db.runTransaction(async (tx) => {
+    const cartSnap = await tx.get(cartRef);
+    if (!cartSnap.exists || !(cartSnap.data().items || []).length) {
+      throw new AppError('Your cart is empty. Add items before placing an order.', 400);
+    }
+    const cartItems = cartSnap.data().items;
+
+    const productRefs = cartItems.map((it) => Product.collection().doc(it.product));
+    const productSnaps = await tx.getAll(...productRefs);
+    const productById = new Map();
+    for (const s of productSnaps) {
+      if (s.exists) productById.set(s.id, s.data());
+    }
+
+    const stockErrors = [];
+    for (const item of cartItems) {
+      const product = productById.get(item.product);
+      if (!product) {
+        stockErrors.push({
+          field: 'cart',
+          message: 'One or more products in your cart no longer exist.',
+        });
+        continue;
+      }
+      if (product.stock !== undefined && product.stock < item.quantity) {
+        stockErrors.push({
+          field: product.name,
+          message: `Only ${product.stock} unit(s) available for "${product.name}".`,
+        });
+      }
+    }
+    if (stockErrors.length > 0) {
+      throw new AppError('Some items in your cart are out of stock.', 400, stockErrors);
+    }
+
+    const orderItems = cartItems.map((item) => {
+      const product = productById.get(item.product);
+      return {
+        product: item.product,
+        name: product.name,
+        price: product.price,
+        quantity: item.quantity,
+        customization: item.customization,
+      };
+    });
+
+    const subtotal = orderItems.reduce((sum, it) => sum + it.price * it.quantity, 0);
+    const shippingCost = subtotal >= 100 ? 0 : 9.99;
+    const total = Math.round((subtotal + shippingCost) * 100) / 100;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    const orderData = {
+      user: req.user.id,
+      orderNumber: Order.generateOrderNumber(),
+      items: orderItems,
+      shippingAddress,
+      paymentMethod,
+      notes: notes || '',
+      subtotal: Math.round(subtotal * 100) / 100,
+      shippingCost,
+      total,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    tx.set(orderRef, orderData);
+    tx.update(cartRef, { items: [], updatedAt: now });
+
+    return orderData;
   });
 
-  if (!cart || cart.items.length === 0) {
-    return next(new AppError('Your cart is empty. Add items before placing an order.', 400));
-  }
+  const orderSnap = await orderRef.get();
+  const order = Order.serialize(orderSnap);
 
-  // Validate stock availability for all items
-  const stockErrors = [];
-  for (const item of cart.items) {
-    if (!item.product) {
-      stockErrors.push({ field: 'cart', message: 'One or more products in your cart no longer exist.' });
-      continue;
-    }
-    if (item.product.stock !== undefined && item.product.stock < item.quantity) {
-      stockErrors.push({
-        field: item.product.name,
-        message: `Only ${item.product.stock} unit(s) available for "${item.product.name}".`,
-      });
-    }
-  }
-
-  if (stockErrors.length > 0) {
-    return next(new AppError('Some items in your cart are out of stock.', 400, stockErrors));
-  }
-
-  // Calculate order total
-  const orderItems = cart.items.map((item) => ({
-    product: item.product._id,
-    name: item.product.name,
-    price: item.product.price,
-    quantity: item.quantity,
-    customization: item.customization,
-  }));
-
-  const subtotal = orderItems.reduce(
-    (sum, item) => sum + item.price * item.quantity,
-    0
-  );
-  const shippingCost = subtotal >= 100 ? 0 : 9.99; // Free shipping over $100
-  const total = Math.round((subtotal + shippingCost) * 100) / 100;
-
-  // Create order
-  const order = await Order.create({
-    user: req.user.id,
-    items: orderItems,
-    shippingAddress,
-    paymentMethod,
-    notes: notes || '',
-    subtotal: Math.round(subtotal * 100) / 100,
-    shippingCost,
-    total,
-    status: 'pending',
-  });
-
-  // Clear the cart after successful order creation
-  cart.items = [];
-  await cart.save();
-
-  logger.info(`Order created: ${order._id} for user ${req.user.id}, total: $${total}`);
+  logger.info(`Order created: ${order.id} for user ${req.user.id}, total: $${result.total}`);
 
   res.status(201).json({
     status: 'success',
     message: 'Order placed successfully.',
     data: {
-      orderId: order._id,
+      orderId: order.id,
       orderNumber: order.orderNumber,
       status: order.status,
       items: order.items,
@@ -101,39 +115,26 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   });
 });
 
-/**
- * GET /api/orders
- * Get all orders for the authenticated user with pagination
- * @query {number} [page=1] - Page number
- * @query {number} [limit=10] - Items per page
- * @query {string} [status] - Filter by order status
- * @query {string} [sort] - Sort field
- */
 exports.getOrders = asyncHandler(async (req, res, next) => {
   const { page = 1, limit = 10, status, sort } = req.query;
 
-  const filter = { user: req.user.id };
-  if (status) filter.status = status;
+  let query = Order.collection().where('user', '==', req.user.id);
+  if (status) query = query.where('status', '==', status);
 
-  let sortObj = { createdAt: -1 };
+  let sortField = 'createdAt';
+  let sortDir = 'desc';
   if (sort) {
-    const sortField = sort.startsWith('-') ? sort.slice(1) : sort;
-    const sortOrder = sort.startsWith('-') ? -1 : 1;
-    sortObj = { [sortField]: sortOrder };
+    sortField = sort.startsWith('-') ? sort.slice(1) : sort;
+    sortDir = sort.startsWith('-') ? 'desc' : 'asc';
   }
+  query = query.orderBy(sortField, sortDir);
 
+  const docs = (await query.get()).docs.map(Order.serialize);
+  const total = docs.length;
   const pageNum = parseInt(page, 10);
   const limitNum = parseInt(limit, 10);
   const skip = (pageNum - 1) * limitNum;
-
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .sort(sortObj)
-      .skip(skip)
-      .limit(limitNum)
-      .lean(),
-    Order.countDocuments(filter),
-  ]);
+  const orders = docs.slice(skip, skip + limitNum);
 
   res.status(200).json({
     status: 'success',
@@ -150,23 +151,13 @@ exports.getOrders = asyncHandler(async (req, res, next) => {
   });
 });
 
-/**
- * GET /api/orders/:id
- * Get a specific order by ID (must belong to authenticated user)
- * @param {string} id - MongoDB ObjectId of the order
- */
 exports.getOrderById = asyncHandler(async (req, res, next) => {
-  const order = await Order.findOne({
-    _id: req.params.id,
-    user: req.user.id,
-  }).lean();
-
-  if (!order) {
+  const snap = await Order.collection().doc(req.params.id).get();
+  if (!snap.exists || snap.data().user !== req.user.id) {
     return next(new AppError('Order not found.', 404));
   }
-
   res.status(200).json({
     status: 'success',
-    data: order,
+    data: Order.serialize(snap),
   });
 });

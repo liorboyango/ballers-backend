@@ -66,13 +66,4 @@ const sanitizeInput = (req, res, next) => {
   next();
 };
 
-/**
- * Validates that a string is a valid MongoDB ObjectId
- * @param {string} id - ID string to validate
- * @returns {boolean} True if valid ObjectId format
- */
-const isValidObjectId = (id) => {
-  return /^[a-fA-F0-9]{24}$/.test(id);
-};
-
-module.exports = { stripHtml, sanitizeObject, sanitizeInput, isValidObjectId };
+module.exports = { stripHtml, sanitizeObject, sanitizeInput };

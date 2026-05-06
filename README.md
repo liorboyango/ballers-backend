@@ -6,7 +6,7 @@ RESTful API for the Ballers World Cup Soccer Kits e-commerce platform.
 
 - **Runtime**: Node.js 20+
 - **Framework**: Express 4
-- **Database**: MongoDB with Mongoose 8
+- **Database**: Firebase Firestore (firebase-admin 12)
 - **Auth**: JWT (jsonwebtoken) + bcryptjs
 - **Validation**: Joi
 - **File Uploads**: Multer
@@ -21,7 +21,7 @@ npm install
 
 # Copy environment variables
 cp .env.example .env
-# Edit .env with your MongoDB URI and JWT secret
+# Edit .env with your Firebase service-account JSON and JWT secret
 
 # Start development server
 npm run dev
@@ -94,7 +94,7 @@ All errors return consistent JSON:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `teamId` | ObjectId | Filter by team |
+| `teamId` | string | Firestore team document id |
 | `kitType` | string | home/away/third/goalkeeper |
 | `minPrice` | number | Minimum price |
 | `maxPrice` | number | Maximum price |
@@ -108,7 +108,8 @@ All errors return consistent JSON:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MONGO_URI` | ✅ | MongoDB connection string |
+| `FIREBASE_SERVICE_ACCOUNT` | ✅ | Firebase service-account JSON (raw or base64-encoded) |
+| `FIREBASE_STORAGE_BUCKET` | ❌ | Storage bucket for product images (defaults to `<project_id>.appspot.com`) |
 | `JWT_SECRET` | ✅ | JWT signing secret |
 | `PORT` | ❌ | Server port (default: 5000) |
 | `NODE_ENV` | ❌ | Environment (development/production) |
@@ -120,6 +121,6 @@ All errors return consistent JSON:
 
 Set these environment variables in Render dashboard:
 - `NODE_ENV=production`
-- `MONGO_URI=<your-atlas-uri>`
+- `FIREBASE_SERVICE_ACCOUNT=<service-account-json-or-base64>`
 - `JWT_SECRET=<strong-random-secret>`
 - `FRONTEND_URL=<your-frontend-url>`
