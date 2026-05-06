@@ -43,6 +43,14 @@ const getBucket = () => admin.storage().bucket();
  */
 const uploadProductImage = async ({ buffer, mimetype, originalname }) => {
   const ext = path.extname(originalname || '').toLowerCase() || '';
+  return uploadProductImageBuffer({ buffer, mimetype, ext });
+};
+
+/**
+ * Lower-level variant: upload a raw buffer with an explicit ext (e.g. from an
+ * AI-generated image where there's no original filename). Returns the public URL.
+ */
+const uploadProductImageBuffer = async ({ buffer, mimetype, ext = '' }) => {
   const objectName = `products/${crypto.randomUUID()}${ext}`;
   const file = getBucket().file(objectName);
 
@@ -73,4 +81,4 @@ const deleteProductImage = async (publicUrl) => {
   }
 };
 
-module.exports = { upload, uploadProductImage, deleteProductImage };
+module.exports = { upload, uploadProductImage, uploadProductImageBuffer, deleteProductImage };

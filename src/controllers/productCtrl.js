@@ -13,7 +13,12 @@
  *    is the public URL we wrote in the upload service.
  */
 const { admin } = require('../services/db');
-const { uploadProductImage, deleteProductImage } = require('../services/upload');
+const {
+  uploadProductImage,
+  uploadProductImageBuffer,
+  deleteProductImage,
+} = require('../services/upload');
+const { generateProductImage } = require('../services/imageGen');
 const Product = require('../models/Product');
 const Team = require('../models/Team');
 const AppError = require('../utils/AppError');
@@ -137,7 +142,26 @@ exports.createProduct = asyncHandler(async (req, res, next) => {
     createdAt: now,
     updatedAt: now,
   };
-  if (req.file) productData.imageUrl = await uploadProductImage(req.file);
+  if (req.file) {
+    productData.imageUrl = await uploadProductImage(req.file);
+  } else {
+    const team = Team.serialize(teamSnap);
+    const t0 = Date.now();
+    const generated = await generateProductImage({ product: productData, team });
+    logger.info(`Image generated in ${Date.now() - t0}ms; uploading to storage`);
+    const t1 = Date.now();
+    productData.imageUrl = await uploadProductImageBuffer({
+      buffer: generated.buffer,
+      mimetype: generated.mimeType,
+      ext: generated.ext,
+    });
+    logger.info(
+      `AI-generated image attached for product "${productData.name}" (upload ${Date.now() - t1}ms, total ${Date.now() - t0}ms)`
+    );
+    if (req.aborted || res.writableEnded) {
+      logger.warn(`Client disconnected before response for "${productData.name}"`);
+    }
+  }
 
   const ref = Product.collection().doc();
   await ref.set(productData);
