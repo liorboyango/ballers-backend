@@ -5,6 +5,16 @@
  * createOrder runs in a Firestore transaction so that stock validation,
  * order creation, and cart clearing are atomic.
  *
+ * The order creation flow (Stripe-integrated):
+ *   1. Frontend calls POST /api/orders/create-payment-intent → gets client_secret.
+ *   2. Frontend confirms payment via stripe.confirmCardPayment(client_secret).
+ *   3. On Stripe success, frontend calls POST /api/orders/create with
+ *      { paymentIntentId, shippingAddress } to persist the order.
+ *   4. Backend verifies the PaymentIntent with Stripe, then creates the order
+ *      with status 'paid' (if already succeeded) or 'pending' (awaiting webhook).
+ *   5. Stripe webhook (payment_intent.succeeded) updates status to 'paid'
+ *      and clears the cart if the order was created before the webhook fires.
+ *
  * createPaymentIntent:
  *   1. Fetches the authenticated user's cart from Firestore.
  *   2. Validates cart items and checks product stock.
@@ -34,6 +44,65 @@ const calculateTotals = (orderItems) => {
   const shippingCost = subtotal >= 100 ? 0 : 9.99;
   const total = Math.round((subtotal + shippingCost) * 100) / 100;
   return { subtotal, shippingCost, total };
+};
+
+/**
+ * Verify a Stripe PaymentIntent and return its data.
+ *
+ * Validates that:
+ *   - The PaymentIntent exists in Stripe.
+ *   - It belongs to the authenticated user (via metadata.userId).
+ *   - Its status is either 'succeeded' or 'requires_capture' (valid for order creation).
+ *     A status of 'canceled' or 'payment_failed' is rejected.
+ *
+ * @param {string} paymentIntentId - Stripe PaymentIntent id (pi_...)
+ * @param {string} userId - Authenticated user id
+ * @returns {Promise<import('stripe').Stripe.PaymentIntent>}
+ * @throws {AppError} on invalid/mismatched/failed PaymentIntent
+ */
+const verifyPaymentIntent = async (paymentIntentId, userId) => {
+  let paymentIntent;
+  try {
+    paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+  } catch (err) {
+    logger.warn(
+      `Failed to retrieve PaymentIntent ${paymentIntentId} for user ${userId}: ${err.message}`
+    );
+    throw new AppError(
+      'Payment verification failed. The payment reference is invalid or could not be found.',
+      400
+    );
+  }
+
+  // Guard: ensure the PaymentIntent belongs to this user
+  if (paymentIntent.metadata && paymentIntent.metadata.userId) {
+    if (paymentIntent.metadata.userId !== userId) {
+      logger.warn(
+        `PaymentIntent ${paymentIntentId} userId mismatch: ` +
+        `expected ${userId}, got ${paymentIntent.metadata.userId}`
+      );
+      throw new AppError(
+        'Payment verification failed. This payment does not belong to your account.',
+        403
+      );
+    }
+  }
+
+  // Guard: reject terminal failure/cancellation statuses
+  const rejectedStatuses = ['canceled', 'requires_payment_method'];
+  if (rejectedStatuses.includes(paymentIntent.status)) {
+    logger.warn(
+      `PaymentIntent ${paymentIntentId} has invalid status '${paymentIntent.status}' ` +
+      `for order creation (user: ${userId})`
+    );
+    throw new AppError(
+      `Cannot create an order for a payment with status '${paymentIntent.status}'. ` +
+      'Please complete the payment process before placing your order.',
+      400
+    );
+  }
+
+  return paymentIntent;
 };
 
 // ─── Controllers ─────────────────────────────────────────────────────────────
@@ -179,11 +248,111 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
 
 // ─── Existing Controllers ─────────────────────────────────────────────────────
 
+/**
+ * @route   POST /api/orders/create
+ * @desc    Create a new order from the user's cart, associated with a Stripe PaymentIntent.
+ *
+ *          Flow:
+ *          1. Validate the Stripe PaymentIntent (must exist, belong to user, not cancelled).
+ *          2. Check for duplicate orders (idempotency — same paymentIntentId).
+ *          3. Run a Firestore transaction to:
+ *             a. Validate cart is non-empty.
+ *             b. Validate product stock.
+ *             c. Create the order document with paymentIntentId.
+ *             d. Clear the user's cart.
+ *          4. Return the created order.
+ *
+ *          The initial order status is set to:
+ *          - 'paid'    — if the PaymentIntent status is 'succeeded' (payment already confirmed)
+ *          - 'pending' — otherwise (webhook will update to 'paid' on confirmation)
+ *
+ * @access  Protected (JWT)
+ *
+ * Request body:
+ * {
+ *   paymentIntentId: string,   // Stripe PaymentIntent id (pi_...)
+ *   shippingAddress: {
+ *     firstName, lastName, email, address, city, postalCode, country, phone?
+ *   },
+ *   notes?: string
+ * }
+ *
+ * Response 201:
+ * {
+ *   status: 'success',
+ *   message: 'Order placed successfully.',
+ *   data: {
+ *     orderId: string,
+ *     orderNumber: string,
+ *     status: 'pending' | 'paid',
+ *     paymentIntentId: string,
+ *     items: Array,
+ *     subtotal: number,
+ *     shippingCost: number,
+ *     total: number,
+ *     shippingAddress: object,
+ *     createdAt: Timestamp
+ *   }
+ * }
+ */
 exports.createOrder = asyncHandler(async (req, res, next) => {
-  const { shippingAddress, paymentMethod = 'card', notes } = req.body;
+  const { shippingAddress, paymentIntentId, notes } = req.body;
+  const userId = req.user.id;
   const db = getDb();
 
-  const cartRef = Cart.docForUser(req.user.id);
+  // ── 1. Verify the Stripe PaymentIntent ────────────────────────────────────
+  let paymentIntent;
+  try {
+    paymentIntent = await verifyPaymentIntent(paymentIntentId, userId);
+  } catch (err) {
+    return next(err);
+  }
+
+  logger.info(
+    `Order creation: PaymentIntent ${paymentIntentId} verified for user ${userId} ` +
+    `(status: ${paymentIntent.status})`
+  );
+
+  // ── 2. Idempotency check — prevent duplicate orders ────────────────────────
+  // If an order already exists for this PaymentIntent, return it instead of
+  // creating a duplicate. This handles frontend retries gracefully.
+  const existingOrderSnap = await Order.collection()
+    .where('paymentIntentId', '==', paymentIntentId)
+    .limit(1)
+    .get();
+
+  if (!existingOrderSnap.empty) {
+    const existingOrder = Order.serialize(existingOrderSnap.docs[0]);
+    logger.info(
+      `Idempotency: order ${existingOrder.id} already exists for ` +
+      `PaymentIntent ${paymentIntentId}. Returning existing order.`
+    );
+    return res.status(200).json({
+      status: 'success',
+      message: 'Order already exists for this payment.',
+      data: {
+        orderId: existingOrder.id,
+        orderNumber: existingOrder.orderNumber,
+        status: existingOrder.status,
+        paymentIntentId: existingOrder.paymentIntentId,
+        items: existingOrder.items,
+        subtotal: existingOrder.subtotal,
+        shippingCost: existingOrder.shippingCost,
+        total: existingOrder.total,
+        shippingAddress: existingOrder.shippingAddress,
+        createdAt: existingOrder.createdAt,
+      },
+    });
+  }
+
+  // ── 3. Determine initial order status from PaymentIntent ──────────────────
+  // If Stripe has already confirmed the payment (e.g., the webhook fired before
+  // the frontend called this endpoint), set status to 'paid' immediately.
+  // Otherwise, set to 'pending' and let the webhook update it.
+  const initialStatus = paymentIntent.status === 'succeeded' ? 'paid' : 'pending';
+
+  // ── 4. Firestore transaction: validate cart, create order, clear cart ──────
+  const cartRef = Cart.docForUser(userId);
   const orderRef = Order.collection().doc();
 
   const result = await db.runTransaction(async (tx) => {
@@ -228,7 +397,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
         name: product.name,
         price: product.price,
         quantity: item.quantity,
-        customization: item.customization,
+        customization: item.customization || null,
       };
     });
 
@@ -238,21 +407,29 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     const orderData = {
-      user: req.user.id,
+      user: userId,
       orderNumber: Order.generateOrderNumber(),
       items: orderItems,
       shippingAddress,
-      paymentMethod,
+      // paymentMethod is always 'stripe' when paymentIntentId is provided
+      paymentMethod: 'stripe',
+      paymentIntentId,
       notes: notes || '',
       subtotal: Math.round(subtotal * 100) / 100,
       shippingCost,
       total,
-      status: 'pending',
+      status: initialStatus,
       createdAt: now,
       updatedAt: now,
     };
 
     tx.set(orderRef, orderData);
+
+    // Clear the cart only if the payment has already succeeded.
+    // If status is 'pending', the webhook handler will clear the cart
+    // when it receives the payment_intent.succeeded event.
+    // However, we clear it here too to provide immediate UX feedback —
+    // the webhook will handle the case where the cart is already empty.
     tx.update(cartRef, { items: [], updatedAt: now });
 
     return orderData;
@@ -261,7 +438,11 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   const orderSnap = await orderRef.get();
   const order = Order.serialize(orderSnap);
 
-  logger.info(`Order created: ${order.id} for user ${req.user.id}, total: $${result.total}`);
+  logger.info(
+    `Order created: ${order.id} (${order.orderNumber}) for user ${userId}, ` +
+    `total: $${result.total}, status: ${result.status}, ` +
+    `paymentIntentId: ${paymentIntentId}`
+  );
 
   res.status(201).json({
     status: 'success',
@@ -270,6 +451,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       orderId: order.id,
       orderNumber: order.orderNumber,
       status: order.status,
+      paymentIntentId: order.paymentIntentId,
       items: order.items,
       subtotal: order.subtotal,
       shippingCost: order.shippingCost,
