@@ -87,6 +87,13 @@ const loginSchema = Joi.object({
 
 /**
  * Schema for POST /api/products (create product)
+ *
+ * Supports two modes:
+ *  1. Manual creation (existing behaviour): requires teamId + optional file upload.
+ *     Gemini generates the image if no file is uploaded.
+ *  2. Bulk import mode (new): provide `images` array of external URLs.
+ *     `teamId` becomes optional; Gemini generation is skipped.
+ *     Sensible defaults are applied when fields are omitted.
  */
 const createProductSchema = Joi.object({
   name: Joi.string().min(2).max(100).trim().required().messages({
@@ -95,35 +102,55 @@ const createProductSchema = Joi.object({
     'any.required': 'Product name is required',
   }),
   description: Joi.string().max(2000).trim().optional().allow(''),
-  price: Joi.number().positive().precision(2).required().messages({
+  price: Joi.number().positive().precision(2).default(99.99).messages({
     'number.positive': 'Price must be a positive number',
-    'any.required': 'Price is required',
   }),
   teamId: Joi.string()
     .pattern(/^[A-Za-z0-9_-]{1,128}$/)
-    .required()
+    .optional()
+    .allow('', null)
     .messages({
       'string.pattern.base': 'teamId must be a valid identifier',
-      'any.required': 'teamId is required',
     }),
-  kitType: Joi.string().valid('home', 'away', 'third', 'goalkeeper').required().messages({
+  kitType: Joi.string().valid('home', 'away', 'third', 'goalkeeper').default('home').messages({
     'any.only': 'kitType must be one of: home, away, third, goalkeeper',
-    'any.required': 'kitType is required',
   }),
   sizes: Joi.array()
     .items(Joi.string().valid('XS', 'S', 'M', 'L', 'XL', 'XXL'))
     .min(1)
-    .required()
+    .default(['S', 'M', 'L', 'XL', 'XXL'])
     .messages({
       'array.min': 'At least one size must be provided',
-      'any.required': 'Sizes are required',
     }),
-  stock: Joi.number().integer().min(0).default(0),
+  stock: Joi.number().integer().min(0).default(10),
   customizable: Joi.boolean().default(true),
   sponsor: Joi.string().max(50).trim().optional().allow(''),
   season: Joi.string().max(20).trim().optional().allow(''),
   isNew: Joi.boolean().default(false),
   isFeatured: Joi.boolean().default(false),
+  /**
+   * Array of external image URLs for bulk import mode.
+   * When provided:
+   *  - Images are downloaded, validated, and uploaded to Firebase Storage.
+   *  - Gemini image generation is skipped.
+   *  - `teamId` is not required.
+   * Maximum 10 images per product (extras are silently truncated).
+   */
+  images: Joi.array()
+    .items(
+      Joi.string()
+        .uri({ scheme: ['http', 'https'] })
+        .max(2048)
+        .messages({
+          'string.uri': 'Each image must be a valid http/https URL',
+          'string.max': 'Image URL must not exceed 2048 characters',
+        })
+    )
+    .max(10)
+    .optional()
+    .messages({
+      'array.max': 'A maximum of 10 images per product are allowed',
+    }),
 });
 
 /**
