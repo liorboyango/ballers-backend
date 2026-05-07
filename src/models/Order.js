@@ -1,11 +1,41 @@
 /**
  * Order collection accessor (Firestore).
+ *
  * Documents shape:
- *   { user, orderNumber, items, shippingAddress, paymentMethod, status,
- *     subtotal, shippingCost, total, notes, createdAt, updatedAt }
+ * {
+ *   user:            string,   // Firebase Auth UID of the order owner
+ *   orderNumber:     string,   // Human-readable order number (e.g. BLR-XXXXXX-XXXX)
+ *   items:           Array<{   // Snapshot of cart items at time of order
+ *     product:       string,   // Product document id
+ *     name:          string,   // Product name (snapshot)
+ *     price:         number,   // Unit price at time of order
+ *     quantity:      number,
+ *     customization: object|null
+ *   }>,
+ *   shippingAddress: object,   // { firstName, lastName, email, address, city, postalCode, country, phone? }
+ *   paymentMethod:   string,   // Always 'stripe' for Stripe-integrated orders
+ *   paymentIntentId: string,   // Stripe PaymentIntent id (pi_...) — used for webhook reconciliation
+ *   status:          string,   // 'pending' | 'paid' | 'payment_failed' | 'processing' | 'shipped' | 'delivered' | 'cancelled'
+ *   notes:           string,   // Optional order notes
+ *   subtotal:        number,   // Sum of item prices
+ *   shippingCost:    number,   // 0 if subtotal >= $100, else $9.99
+ *   total:           number,   // subtotal + shippingCost
+ *   stripeEventId:   string?,  // Stripe event id from the last webhook that updated this order
+ *   createdAt:       Timestamp,
+ *   updatedAt:       Timestamp
+ * }
+ *
+ * Status lifecycle:
+ *   pending → paid (via webhook payment_intent.succeeded)
+ *   pending → payment_failed (via webhook payment_intent.payment_failed)
+ *   paid → processing → shipped → delivered
+ *   any → cancelled
  *
  * `orderNumber` is generated in the controller before write
  * (Firestore has no per-save hooks).
+ *
+ * `paymentIntentId` is indexed in Firestore to allow efficient lookup
+ * by the webhook handler (findOrderByPaymentIntent query).
  */
 const { getDb } = require('../services/db');
 

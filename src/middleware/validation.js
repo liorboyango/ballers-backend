@@ -282,17 +282,28 @@ const shippingAddressSchema = Joi.object({
 
 /**
  * Schema for POST /api/orders/create
+ *
+ * Requires a Stripe PaymentIntent id (pi_...) to associate the order
+ * with a verified payment. The paymentIntentId is validated against
+ * Stripe in the controller before the order is created.
  */
 const createOrderSchema = Joi.object({
+  /**
+   * Stripe PaymentIntent id returned by POST /api/orders/create-payment-intent.
+   * Must start with 'pi_' and be between 10 and 128 characters.
+   * Required — orders cannot be created without a valid payment reference.
+   */
+  paymentIntentId: Joi.string()
+    .pattern(/^pi_[A-Za-z0-9_]{6,124}$/)
+    .required()
+    .messages({
+      'string.pattern.base':
+        'paymentIntentId must be a valid Stripe PaymentIntent id (starts with pi_)',
+      'any.required': 'paymentIntentId is required to associate the order with a payment',
+    }),
   shippingAddress: shippingAddressSchema.required().messages({
     'any.required': 'Shipping address is required',
   }),
-  paymentMethod: Joi.string()
-    .valid('card', 'paypal', 'stripe')
-    .default('card')
-    .messages({
-      'any.only': 'Payment method must be one of: card, paypal, stripe',
-    }),
   notes: Joi.string().max(500).trim().optional().allow('').messages({
     'string.max': 'Order notes cannot exceed 500 characters',
   }),
@@ -305,7 +316,7 @@ const getOrdersQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   limit: Joi.number().integer().min(1).max(50).default(10),
   status: Joi.string()
-    .valid('pending', 'processing', 'shipped', 'delivered', 'cancelled')
+    .valid('pending', 'paid', 'payment_failed', 'processing', 'shipped', 'delivered', 'cancelled')
     .optional(),
   sort: Joi.string().valid('createdAt', '-createdAt', 'total', '-total').optional(),
 });

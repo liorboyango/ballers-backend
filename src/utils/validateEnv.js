@@ -34,8 +34,28 @@ const OPTIONAL_ENV_VARS = [
 ];
 
 /**
+ * Stripe-related environment variables.
+ * These are not strictly required at startup (the app can run without
+ * payment features), but a warning is emitted so operators know they
+ * need to configure them before enabling checkout.
+ */
+const STRIPE_ENV_VARS = [
+  {
+    name: 'STRIPE_SECRET_KEY',
+    description:
+      'Stripe secret API key (sk_test_... or sk_live_...). Required for payment processing.',
+  },
+  {
+    name: 'STRIPE_WEBHOOK_SECRET',
+    description:
+      'Stripe webhook signing secret (whsec_...). Required for verifying webhook events.',
+  },
+];
+
+/**
  * Validates all required environment variables are present.
  * Throws an error listing all missing variables if any are absent.
+ * Emits console warnings for missing Stripe variables.
  *
  * @throws {Error} If any required environment variables are missing
  */
@@ -51,12 +71,24 @@ function validateEnv() {
     );
   }
 
-  // Warn about optional vars using defaults
+  // Apply defaults for optional vars that are not set
   OPTIONAL_ENV_VARS.forEach(({ name, default: defaultVal }) => {
     if (!process.env[name]) {
       process.env[name] = defaultVal;
     }
   });
+
+  // Warn about missing Stripe configuration (non-fatal at startup)
+  const missingStripe = STRIPE_ENV_VARS.filter(({ name }) => !process.env[name]);
+  if (missingStripe.length > 0) {
+    const details = missingStripe
+      .map(({ name, description }) => `  - ${name}: ${description}`)
+      .join('\n');
+    console.warn(
+      `[WARNING] Missing Stripe environment variables (payment features will be unavailable):\n${details}\n` +
+        `Please add them to your .env file. See .env.example for guidance.`
+    );
+  }
 }
 
-module.exports = { validateEnv, REQUIRED_ENV_VARS, OPTIONAL_ENV_VARS };
+module.exports = { validateEnv, REQUIRED_ENV_VARS, OPTIONAL_ENV_VARS, STRIPE_ENV_VARS };
