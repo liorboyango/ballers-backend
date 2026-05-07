@@ -12,6 +12,16 @@ const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
 const { UPLOAD_LIMITS } = require('../utils/constants');
 
+/**
+ * Cache-Control value applied to every image stored in Firebase Storage.
+ * - public        : may be cached by any cache (browser, CDN, proxy)
+ * - max-age=31536000 : cache for 1 year (images are content-addressed UUIDs)
+ * - immutable     : tells CDN/browser the resource will never change at this URL
+ *
+ * Exported so controllers can echo the same value in HTTP response headers.
+ */
+const IMAGE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+
 const fileFilter = (req, file, cb) => {
   if (UPLOAD_LIMITS.ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
@@ -31,7 +41,7 @@ const upload = multer({
   fileFilter,
   limits: {
     fileSize: UPLOAD_LIMITS.MAX_FILE_SIZE,
-    files: 1,
+    files: 10,
   },
 });
 
@@ -49,6 +59,9 @@ const uploadProductImage = async ({ buffer, mimetype, originalname }) => {
 /**
  * Lower-level variant: upload a raw buffer with an explicit ext (e.g. from an
  * AI-generated image where there's no original filename). Returns the public URL.
+ *
+ * Sets cacheControl to IMAGE_CACHE_CONTROL so Firebase Storage serves the
+ * correct Cache-Control header to browsers and CDN edge nodes.
  */
 const uploadProductImageBuffer = async ({ buffer, mimetype, ext = '' }) => {
   const objectName = `products/${crypto.randomUUID()}${ext}`;
@@ -57,7 +70,7 @@ const uploadProductImageBuffer = async ({ buffer, mimetype, ext = '' }) => {
   await file.save(buffer, {
     contentType: mimetype,
     resumable: false,
-    metadata: { cacheControl: 'public, max-age=31536000' },
+    metadata: { cacheControl: IMAGE_CACHE_CONTROL },
   });
   await file.makePublic();
 
@@ -81,4 +94,10 @@ const deleteProductImage = async (publicUrl) => {
   }
 };
 
-module.exports = { upload, uploadProductImage, uploadProductImageBuffer, deleteProductImage };
+module.exports = {
+  upload,
+  uploadProductImage,
+  uploadProductImageBuffer,
+  deleteProductImage,
+  IMAGE_CACHE_CONTROL,
+};

@@ -25,7 +25,7 @@ const app = express();
 
 /**
  * Helmet sets various HTTP headers to protect against common web vulnerabilities.
- * Configured to allow serving static files from /uploads.
+ * Configured to allow serving static files and cross-origin image loading.
  */
 app.use(
   helmet({
@@ -146,6 +146,7 @@ app.use('/api/teams', require('./routes/api/teams'));
 app.use('/api/products', require('./routes/api/products'));
 app.use('/api/cart', require('./routes/api/cart'));
 app.use('/api/orders', require('./routes/api/orders'));
+app.use('/api/upload', require('./routes/api/upload'));
 
 // ─── Error Handling ──────────────────────────────────────────────────────────
 
