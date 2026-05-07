@@ -1,35 +1,40 @@
 /**
- * Yupoo Category & Crawl Service
+ * Supplier Category & Crawl Service
  *
- * Fetches the Yupoo store categories page and parses the HTML into a
+ * Fetches the supplier store categories page and parses the HTML into a
  * structured tree of main categories and their subcategories.
  *
- * Also exposes crawlSelectedCategories() which fetches every individual
- * category page, parses album/product blocks, and creates products via
- * the internal createProduct helper.
+ * Also exposes crawlSelectedCategories(), which runs a two-stage crawl:
+ *   1. Fetch each category listing page and extract the list of album cards
+ *      (one per product) with their detail-page URLs.
+ *   2. For each album, fetch the album detail page and extract the full set
+ *      of high-quality product images, then create a product via the internal
+ *      createProduct helper.
  *
  * Error handling:
  *   - Network errors are classified by type (timeout, rate_limit, server_error, etc.)
  *   - Axios errors are wrapped with actionable context before being re-thrown
  *   - A circuit breaker halts the crawl when too many consecutive category
- *     failures occur (prevents wasting time & resources on a broken session)
+ *     listing fetches fail (prevents wasting time & resources on a broken session)
  *   - Partial image-upload failures on product creation are cleaned up
  *     automatically to avoid orphaned Storage objects
  *
  * Caching:
  *   Parsed category results are stored in-memory for CACHE_TTL_MS (1 hour)
- *   to avoid hitting the external Yupoo server on every admin request.
+ *   to avoid hitting the external supplier server on every admin request.
  *
  * Retry logic:
  *   Up to MAX_RETRIES attempts with exponential-backoff-plus-jitter between
  *   tries to handle transient network errors gracefully.
  *
  * Security:
- *   - Only GET requests are made to a hard-coded Yupoo URL (no user input).
+ *   - Only GET requests are made to a hard-coded supplier URL (no user input).
+ *   - Album detail URLs collected from listing pages are validated to begin
+ *     with `/albums/` before being fetched.
  *   - The response Content-Type is validated to be HTML before cheerio
  *     touches it.
  *   - Timeouts prevent the fetch from hanging indefinitely.
- *   - External image URLs are validated against the yupoo photo domain
+ *   - External image URLs are validated against the supplier photo domain
  *     before being passed to the product creation pipeline.
  */
 
@@ -47,14 +52,14 @@ const { CrawlLogger } = require('../utils/crawlLogger');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-/** The Yupoo store whose categories we crawl (hard-coded, not user-supplied). */
-const YUPOO_BASE_URL = 'https://micom0078.x.yupoo.com';
-const CATEGORIES_URL = `${YUPOO_BASE_URL}/categories/`;
+/** The supplier store whose categories we crawl (hard-coded, not user-supplied). */
+const SUPPLIER_BASE_URL = 'https://micom0078.x.yupoo.com';
+const CATEGORIES_URL = `${SUPPLIER_BASE_URL}/categories/`;
 
 /** Allowed image hostname for URL-origin validation. */
-const YUPOO_PHOTO_HOSTNAME = 'photo.yupoo.com';
+const SUPPLIER_PHOTO_HOSTNAME = 'photo.yupoo.com';
 
-/** Maximum time (ms) to wait for Yupoo to respond per request. */
+/** Maximum time (ms) to wait for the supplier to respond per request. */
 const FETCH_TIMEOUT_MS = 20_000;
 
 /** How long (ms) to keep the parsed tree in the in-memory cache. */
@@ -72,8 +77,8 @@ const RETRY_MAX_DELAY_MS = 5_000;
 
 /**
  * Polite crawl delay range (ms). A random value between MIN and MAX is
- * awaited between consecutive category-page requests to avoid hammering
- * the Yupoo server.
+ * awaited between consecutive page requests to avoid hammering the
+ * supplier server.
  */
 const CRAWL_DELAY_MIN_MS = 500;
 const CRAWL_DELAY_MAX_MS = 1_200;
@@ -82,13 +87,13 @@ const CRAWL_DELAY_MAX_MS = 1_200;
 const MAX_IMAGES_PER_PRODUCT = 10;
 
 /**
- * Circuit-breaker threshold: if this many consecutive category fetches fail,
- * the crawl is aborted early with an error entry in the result.
+ * Circuit-breaker threshold: if this many consecutive category-listing fetches
+ * fail, the crawl is aborted early with an error entry in the result.
  */
 const CIRCUIT_BREAKER_THRESHOLD = 5;
 
 /**
- * HTTP status codes from Yupoo that should NOT be retried
+ * HTTP status codes from the supplier that should NOT be retried
  * (client errors indicating a permanent failure for this URL).
  */
 const NON_RETRYABLE_HTTP_STATUSES = new Set([400, 401, 403, 404, 410]);
@@ -149,7 +154,7 @@ const backoffDelay = (attempt) => {
 };
 
 /**
- * Error type classification for Yupoo fetch failures.
+ * Error type classification for supplier fetch failures.
  *
  * Used in structured log entries and crawl error reports so that operators
  * can distinguish transient network issues from policy-based blocks.
@@ -209,7 +214,7 @@ const classifyFetchError = (err) => {
     }
   }
 
-  // AppError thrown by fetchYupooPage for unexpected Content-Type
+  // AppError thrown by fetchSupplierPage for unexpected Content-Type
   if (err instanceof AppError && err.statusCode === 502) {
     return { type: FetchErrorType.INVALID_RESPONSE, retryable: false, httpStatus: null };
   }
@@ -218,7 +223,7 @@ const classifyFetchError = (err) => {
 };
 
 /**
- * Shared browser-like HTTP headers used for all Yupoo GET requests.
+ * Shared browser-like HTTP headers used for all supplier GET requests.
  */
 const BROWSER_HEADERS = {
   'User-Agent':
@@ -231,7 +236,7 @@ const BROWSER_HEADERS = {
 };
 
 /**
- * Fetches a Yupoo HTML page with exponential-backoff retry logic.
+ * Fetches a supplier HTML page with exponential-backoff retry logic.
  *
  * Retries are only applied to retryable error types (see classifyFetchError).
  * Each retry waits for backoffDelay(attempt) ms before the next attempt.
@@ -244,7 +249,7 @@ const BROWSER_HEADERS = {
  * @returns {Promise<{ html: string, bytes: number, attempt: number, durationMs: number }>}
  * @throws {AppError} When all retries are exhausted or a non-retryable error occurs
  */
-const fetchYupooPage = async (url, label = url, opts = {}) => {
+const fetchSupplierPage = async (url, label = url, opts = {}) => {
   const { clog = null, category = null } = opts;
   let lastError;
   let lastClassification = null;
@@ -253,7 +258,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const attemptStart = Date.now();
     try {
-      logger.info(`[yupooService] Fetching "${label}" (attempt ${attempt}/${MAX_RETRIES})`, {
+      logger.info(`[supplierService] Fetching "${label}" (attempt ${attempt}/${MAX_RETRIES})`, {
         url,
       });
 
@@ -266,7 +271,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
       const contentType = response.headers['content-type'] || '';
       if (!contentType.includes('text/html')) {
         throw new AppError(
-          `Unexpected Content-Type from Yupoo: "${contentType}". Expected text/html.`,
+          `Unexpected Content-Type from supplier: "${contentType}". Expected text/html.`,
           502
         );
       }
@@ -275,7 +280,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
       const bytes = typeof html === 'string' ? html.length : 0;
       const durationMs = Date.now() - attemptStart;
 
-      logger.info(`[yupooService] Fetched "${label}" successfully`, {
+      logger.info(`[supplierService] Fetched "${label}" successfully`, {
         bytes,
         attempt,
         durationMs,
@@ -290,19 +295,19 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
       // Non-retryable errors — stop immediately
       if (!lastClassification.retryable) {
         logger.error(
-          `[yupooService] Non-retryable error (${lastClassification.type}) ` +
+          `[supplierService] Non-retryable error (${lastClassification.type}) ` +
           `fetching "${label}" after ${attemptDuration}ms — ${err.message}`
         );
         break;
       }
 
-      // Check if we've also hit a Yupoo client-error HTTP code
+      // Check if we've also hit a supplier client-error HTTP code
       if (
         lastClassification.httpStatus &&
         NON_RETRYABLE_HTTP_STATUSES.has(lastClassification.httpStatus)
       ) {
         logger.error(
-          `[yupooService] HTTP ${lastClassification.httpStatus} (permanent) ` +
+          `[supplierService] HTTP ${lastClassification.httpStatus} (permanent) ` +
           `fetching "${label}" — not retrying`
         );
         break;
@@ -323,7 +328,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
           });
         } else {
           logger.warn(
-            `[yupooService] Fetch attempt ${attempt} failed (${lastClassification.type}); ` +
+            `[supplierService] Fetch attempt ${attempt} failed (${lastClassification.type}); ` +
             `retrying in ${delay}ms — ${err.message}`
           );
         }
@@ -334,7 +339,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
 
   const totalDuration = Date.now() - fetchStart;
   logger.error(
-    `[yupooService] All fetch attempts failed for "${label}" ` +
+    `[supplierService] All fetch attempts failed for "${label}" ` +
     `(${totalDuration}ms total)`,
     { url, error: lastError && lastError.message, classification: lastClassification }
   );
@@ -345,7 +350,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
   const httpStatus = lastClassification ? lastClassification.httpStatus : null;
 
   const msg =
-    `Failed to fetch Yupoo page "${label}" after ${MAX_RETRIES} attempts ` +
+    `Failed to fetch supplier page "${label}" after ${MAX_RETRIES} attempts ` +
     `[${errorType}${httpStatus ? ` HTTP ${httpStatus}` : ''}]: ` +
     (lastError ? lastError.message : 'unknown error');
 
@@ -372,7 +377,7 @@ const fetchYupooPage = async (url, label = url, opts = {}) => {
  */
 
 /**
- * Extracts the numeric category ID from a Yupoo category URL path.
+ * Extracts the numeric category ID from a supplier category URL path.
  *
  * @param {string} href
  * @returns {string|null}
@@ -386,9 +391,9 @@ const extractCategoryId = (href) => {
 };
 
 /**
- * Parses the raw Yupoo categories HTML into a CategoryTree array.
+ * Parses the raw supplier categories HTML into a CategoryTree array.
  *
- * @param {string} html - Raw HTML string from the Yupoo categories page
+ * @param {string} html - Raw HTML string from the supplier categories page
  * @returns {CategoryTree[]}
  */
 const parseCategories = (html) => {
@@ -409,7 +414,7 @@ const parseCategories = (html) => {
 
     const id = extractCategoryId(href);
     if (!id) {
-      logger.debug('[yupooService] Skipping category with unparseable href', { href });
+      logger.debug('[supplierService] Skipping category with unparseable href', { href });
       return;
     }
 
@@ -427,7 +432,7 @@ const parseCategories = (html) => {
 
       const subId = extractCategoryId(subHref);
       if (!subId) {
-        logger.debug('[yupooService] Skipping subcategory with unparseable href', {
+        logger.debug('[supplierService] Skipping subcategory with unparseable href', {
           href: subHref,
         });
         return;
@@ -452,7 +457,7 @@ const parseCategories = (html) => {
     });
   });
 
-  logger.info('[yupooService] Parsed categories from HTML', {
+  logger.info('[supplierService] Parsed categories from HTML', {
     total: categories.length,
     withSubcategories: categories.filter((c) => c.subcategories.length > 0).length,
   });
@@ -460,7 +465,13 @@ const parseCategories = (html) => {
   return categories;
 };
 
-// ─── Category Page (Album List) Parser ────────────────────────────────────────
+// ─── Album / Product Helpers ──────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} AlbumLink
+ * @property {string} name      - Album/product title from the listing card
+ * @property {string} albumPath - Path to the album detail page (e.g. "/albums/166889738?...")
+ */
 
 /**
  * @typedef {Object} ProductBatch
@@ -469,23 +480,39 @@ const parseCategories = (html) => {
  */
 
 /**
- * Validates that a URL originates from the Yupoo photo CDN.
+ * Validates that a URL originates from the supplier photo CDN.
  * This prevents passing arbitrary external URLs into the download pipeline.
  *
  * @param {string} url
  * @returns {boolean}
  */
-const isYupooPhotoUrl = (url) => {
+const isSupplierPhotoUrl = (url) => {
   try {
     const { hostname } = new URL(url);
-    return hostname === YUPOO_PHOTO_HOSTNAME;
+    return hostname === SUPPLIER_PHOTO_HOSTNAME;
   } catch {
     return false;
   }
 };
 
 /**
- * Replaces any size suffix (small, medium, large, thumb, etc.) in a Yupoo
+ * Validates that a path points to an album detail page on the supplier's
+ * site. We refuse anything that isn't an `/albums/<digits>` path so the
+ * crawler cannot be coerced into fetching arbitrary URLs.
+ *
+ * @param {string} albumPath
+ * @returns {boolean}
+ */
+const isAlbumPath = (albumPath) => {
+  if (typeof albumPath !== 'string' || !albumPath.startsWith('/albums/')) {
+    return false;
+  }
+  const idPart = albumPath.slice('/albums/'.length).split(/[?/]/)[0];
+  return /^\d+$/.test(idPart);
+};
+
+/**
+ * Replaces any size suffix (small, medium, large, thumb, etc.) in a supplier
  * photo URL with "big" to obtain the highest-quality variant.
  *
  * Examples:
@@ -504,113 +531,90 @@ const toBigJpgUrl = (url) => {
   );
 };
 
+// ─── Category Listing Page Parser ─────────────────────────────────────────────
+
 /**
- * Parses a single Yupoo category page HTML and returns an array of
- * ProductBatch objects — one per album/product block found on the page.
+ * Parses a category listing page HTML and returns the album cards present
+ * on it. Each card is rendered as `<a class="album__main" title="…" href="/albums/…">`.
  *
- * The page may list many albums; each `.showalbumheader__main` block
- * represents one product. This function does NOT follow pagination;
- * only the first page of results is processed (typically 20–30 albums).
+ * The listing page does NOT contain the full image grid — only a cover image
+ * per album. To get every product image, the caller must follow each
+ * `albumPath` and run `parseAlbumDetail` on the response.
  *
- * Product title is extracted from (in priority order):
- *   1. `span[data-name]` attribute inside `.showalbumheader__gallerytitle`
- *   2. `h1` text content inside `.showalbumheader__main`
- *   3. Fallback: empty string (will be filtered out by the caller)
- *
- * Image URLs are collected from:
- *   `.showalbum__imagecardwrap img[data-src]`
- * and converted to big.jpg variants.
- *
- * @param {string} html - Raw HTML of a Yupoo category page
- * @returns {ProductBatch[]}
+ * @param {string} html - Raw HTML of a supplier category listing page
+ * @returns {AlbumLink[]}
  */
-const parseCategoryPage = (html) => {
+const parseAlbumListing = (html) => {
   const $ = cheerio.load(html);
-  const products = [];
+  const albums = [];
+  const seen = new Set();
 
-  // Each album on a category listing page has its header info in
-  // .showalbumheader__main and its images in .showalbum__imagecardwrap
-  //
-  // Note: on a category PAGE (not an album detail page) there will be
-  // multiple .showalbumheader__main blocks — one per album listed.
-  // However, the .showalbum__imagecardwrap images belong to the full album
-  // detail view when viewing a single album.  On the *category listing* page
-  // the albums are shown as cards without the full image grid.
-  //
-  // The HTML provided in the task shows a single-album detail page structure
-  // where ALL images are present in one .showalbum__imagecardwrap block.
-  // We handle both cases:
-  //   A) Category listing page  — multiple .showalbumheader__main, no inline images
-  //   B) Album detail page      — one .showalbumheader__main + all images inline
+  $('a.album__main').each((_i, el) => {
+    const $a = $(el);
+    const href = ($a.attr('href') || '').trim();
+    const title = ($a.attr('title') || '').trim();
 
-  const $headers = $('.showalbumheader__main');
-
-  if ($headers.length === 0) {
-    logger.debug('[yupooService] parseCategoryPage: no .showalbumheader__main found');
-    return products;
-  }
-
-  if ($headers.length === 1) {
-    // ── Case B: single album detail page ─────────────────────────────────
-    const $header = $headers.first();
-
-    const title = extractAlbumTitle($, $header);
-    if (!title) {
-      logger.debug('[yupooService] parseCategoryPage: could not extract album title');
-      return products;
+    if (!title || !href) return;
+    if (!isAlbumPath(href)) {
+      logger.debug('[supplierService] Skipping album card with unsupported href', { href });
+      return;
     }
+    if (seen.has(href)) return; // dedupe in case the same card appears twice
 
-    const imageUrls = extractAlbumImages($);
-
-    if (imageUrls.length > 0) {
-      products.push({ name: title, images: imageUrls });
-    } else {
-      logger.debug(`[yupooService] Album "${title}" has no extractable images — skipping`);
-    }
-  } else {
-    // ── Case A: category listing page — multiple album cards ─────────────
-    // On listing pages each album card only contains a cover image inside
-    // its own .showalbumheader__gallerycover img, NOT the full image grid.
-    // We return one ProductBatch per card using whatever images are present.
-    $headers.each((_i, headerEl) => {
-      const $header = $(headerEl);
-      const title = extractAlbumTitle($, $header);
-      if (!title) return; // skip unlabelled cards
-
-      // Grab images scoped to this card's parent wrapper
-      const $parent = $header.closest('.showalbum__children, .showalbum__parent, [class*="album"]');
-      const scopedImages = $parent.length
-        ? extractScopedImages($, $parent)
-        : [];
-
-      // Fall back to the cover image inside the header block itself
-      const coverSrc = $header.find('.showalbumheader__gallerycover img').attr('src') ||
-        $header.find('.showalbumheader__gallerycover img').attr('data-src') || '';
-      const allImages = scopedImages.length > 0
-        ? scopedImages
-        : (coverSrc ? [toBigJpgUrl(coverSrc)] : []);
-
-      const validImages = allImages.filter(isYupooPhotoUrl).slice(0, MAX_IMAGES_PER_PRODUCT);
-
-      if (validImages.length > 0) {
-        products.push({ name: title, images: validImages });
-      }
-    });
-  }
-
-  logger.info('[yupooService] parseCategoryPage: extracted products', {
-    count: products.length,
+    seen.add(href);
+    albums.push({ name: title, albumPath: href });
   });
 
-  return products;
+  logger.info('[supplierService] parseAlbumListing: extracted albums', {
+    count: albums.length,
+  });
+
+  return albums;
+};
+
+// ─── Album Detail Page Parser ─────────────────────────────────────────────────
+
+/**
+ * Parses a single album detail page and returns the product batch (title +
+ * image URLs) for that album, or null when nothing useful was found.
+ *
+ * Title is taken from (in priority order):
+ *   1. `[data-name]` attribute inside `.showalbumheader__main`
+ *   2. `h1` text content inside `.showalbumheader__main`
+ *
+ * Images are collected from `.showalbum__imagecardwrap img[data-src]`,
+ * normalised to the `big.jpg` variant, and filtered to the supplier photo
+ * domain.
+ *
+ * @param {string} html - Raw HTML of a supplier album detail page
+ * @returns {ProductBatch|null}
+ */
+const parseAlbumDetail = (html) => {
+  const $ = cheerio.load(html);
+
+  const $header = $('.showalbumheader__main').first();
+  if ($header.length === 0) {
+    logger.debug('[supplierService] parseAlbumDetail: no .showalbumheader__main found');
+    return null;
+  }
+
+  const name = extractAlbumTitle($, $header);
+  if (!name) {
+    logger.debug('[supplierService] parseAlbumDetail: could not extract album title');
+    return null;
+  }
+
+  const images = extractAlbumImages($);
+
+  return { name, images };
 };
 
 /**
- * Extracts the album/product title from a .showalbumheader__main element.
+ * Extracts the album/product title from a `.showalbumheader__main` element.
  *
  * Priority:
- *   1. span[data-name] attribute  (most reliable, present in modern Yupoo)
- *   2. h1 text content
+ *   1. `[data-name]` attribute  (most reliable, present in modern markup)
+ *   2. `h1` text content
  *
  * @param {CheerioStatic} $
  * @param {Cheerio} $header
@@ -629,8 +633,9 @@ const extractAlbumTitle = ($, $header) => {
 };
 
 /**
- * Collects all big.jpg image URLs from .showalbum__imagecardwrap img[data-src]
- * within the entire page (used for album detail pages).
+ * Collects up to MAX_IMAGES_PER_PRODUCT image URLs from
+ * `.showalbum__imagecardwrap img[data-src]`, normalised to big.jpg and
+ * filtered to the supplier photo domain.
  *
  * @param {CheerioStatic} $
  * @returns {string[]}
@@ -641,27 +646,7 @@ const extractAlbumImages = ($) => {
     const dataSrc = $(img).attr('data-src') || '';
     if (!dataSrc) return;
     const bigUrl = toBigJpgUrl(dataSrc);
-    if (isYupooPhotoUrl(bigUrl)) {
-      urls.push(bigUrl);
-    }
-  });
-  return urls.slice(0, MAX_IMAGES_PER_PRODUCT);
-};
-
-/**
- * Collects big.jpg image URLs scoped to a particular DOM element.
- *
- * @param {CheerioStatic} $
- * @param {Cheerio} $scope
- * @returns {string[]}
- */
-const extractScopedImages = ($, $scope) => {
-  const urls = [];
-  $scope.find('img[data-src]').each((_i, img) => {
-    const dataSrc = $(img).attr('data-src') || '';
-    if (!dataSrc) return;
-    const bigUrl = toBigJpgUrl(dataSrc);
-    if (isYupooPhotoUrl(bigUrl)) {
+    if (isSupplierPhotoUrl(bigUrl)) {
       urls.push(bigUrl);
     }
   });
@@ -724,6 +709,9 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = 
   try {
     storageUrls = await downloadAndUploadImages(imageUrls, {
       maxImages: MAX_IMAGES_PER_PRODUCT,
+      // Yupoo's photo CDN returns HTTP 567 (anti-hotlinking) without a
+      // Referer that points back to the supplier domain.
+      referer: `${SUPPLIER_BASE_URL}/`,
     });
   } catch (uploadErr) {
     // downloadAndUploadImages throws AppError(422) when ALL images fail.
@@ -762,14 +750,14 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = 
     // to avoid orphaned objects accumulating in the bucket.
     if (storageUrls.length > 0) {
       logger.warn(
-        `[yupooService] Firestore write failed for "${name}"; ` +
+        `[supplierService] Firestore write failed for "${name}"; ` +
         `cleaning up ${storageUrls.length} uploaded image(s)`,
         { error: writeErr.message }
       );
       // Best-effort cleanup (non-blocking; failures are logged inside deleteProductImages)
       deleteProductImages(storageUrls).catch((cleanupErr) => {
         logger.error(
-          `[yupooService] Storage cleanup failed for "${name}": ${cleanupErr.message}`
+          `[supplierService] Storage cleanup failed for "${name}": ${cleanupErr.message}`
         );
       });
     }
@@ -777,7 +765,7 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = 
   }
 
   logger.info(
-    `[yupooService] Created product "${name}" (${ref.id}) with ${storageUrls.length} image(s)`
+    `[supplierService] Created product "${name}" (${ref.id}) with ${storageUrls.length} image(s)`
   );
 
   return { id: ref.id, imageCount: storageUrls.length };
@@ -796,7 +784,7 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = 
 /**
  * @typedef {Object} CrawlResult
  * @property {number}             created    - Number of products successfully created
- * @property {number}             skipped    - Number of products skipped (duplicates)
+ * @property {number}             skipped    - Number of products skipped (duplicates / no images)
  * @property {CrawlErrorEntry[]}  errors     - Per-item error details
  * @property {string[]}           ids        - Firestore IDs of created products
  * @property {number}             durationMs - Total crawl duration in ms
@@ -804,27 +792,19 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = 
  */
 
 /**
- * Crawls a flat list of category nodes (main categories and/or subcategories),
- * fetches each category page, parses album blocks, and creates products.
+ * Crawls a flat list of category nodes (main categories and/or subcategories).
  *
- * Algorithm:
- *   1. For each selected category node:
- *      a. Build URL: `${YUPOO_BASE_URL}${node.path}`
- *      b. Optionally append `?isSubCate=true` for subcategories
- *      c. Fetch + parse the page → ProductBatch[]
- *      d. For each ProductBatch:
- *         - Check for duplicate (name match) → skip if found
- *         - createCrawledProduct() → record id
- *      e. Apply polite crawl delay before next category
- *   2. Return aggregated CrawlResult
+ * For each category we:
+ *   1. Fetch the category listing page → list of AlbumLink cards.
+ *   2. For each album card, fetch the album detail page and parse it into
+ *      a ProductBatch (title + up to 10 big.jpg images).
+ *   3. Skip duplicates by name; create a product for everything else.
+ *   4. Apply a polite delay between every outbound request.
  *
  * Circuit breaker:
- *   If CIRCUIT_BREAKER_THRESHOLD consecutive category fetches fail, the crawl
- *   is aborted and the result includes `aborted: true`.
- *
- * Errors at the category level (fetch failure) are recorded in `errors`
- * and crawling continues with remaining categories (unless circuit trips).
- * Errors at the product level are similarly recorded and processing continues.
+ *   If CIRCUIT_BREAKER_THRESHOLD consecutive listing-page fetches fail, the
+ *   crawl is aborted and the result includes `aborted: true`. Album-detail
+ *   fetch failures are recorded per-product but do not trip the breaker.
  *
  * @param {Array<{id: string, name: string, path: string, isSubCate?: boolean}>} selectedCategories
  * @param {object} [defaults={}] - Override default product fields
@@ -855,7 +835,7 @@ const crawlSelectedCategories = async (
   const jobStart = Date.now();
   clog.jobStart();
 
-  logger.info(`[yupooService] Starting crawl job ${jobId} for ${total} category nodes`, {
+  logger.info(`[supplierService] Starting crawl job ${jobId} for ${total} category nodes`, {
     defaults,
     userId,
   });
@@ -884,16 +864,16 @@ const crawlSelectedCategories = async (
 
     clog.categoryStart(category, i + 1);
 
-    // ── Build URL ────────────────────────────────────────────────────────
-    let categoryUrl = `${YUPOO_BASE_URL}${category.path}`;
+    // ── Build URL for the category listing page ──────────────────────────
+    let categoryUrl = `${SUPPLIER_BASE_URL}${category.path}`;
     if (category.isSubCate) {
       categoryUrl += '?isSubCate=true';
     }
 
-    // ── Fetch + parse category page ──────────────────────────────────────
-    let products;
+    // ── Fetch + parse the listing page ───────────────────────────────────
+    let albums;
     try {
-      const fetchResult = await fetchYupooPage(categoryUrl, categoryLabel, {
+      const fetchResult = await fetchSupplierPage(categoryUrl, categoryLabel, {
         clog,
         category,
       });
@@ -904,9 +884,9 @@ const crawlSelectedCategories = async (
         durationMs: fetchResult.durationMs,
       });
 
-      products = parseCategoryPage(fetchResult.html);
+      albums = parseAlbumListing(fetchResult.html);
 
-      clog.categoryParsed(category, { productCount: products.length });
+      clog.categoryParsed(category, { productCount: albums.length });
 
       // Reset circuit breaker on successful fetch
       consecutiveFailures = 0;
@@ -932,33 +912,42 @@ const crawlSelectedCategories = async (
     }
 
     logger.info(
-      `[yupooService] Category "${categoryLabel}" yielded ${products.length} product(s)`
+      `[supplierService] Category "${categoryLabel}" yielded ${albums.length} album(s)`
     );
 
-    // ── Create products ──────────────────────────────────────────────────
+    // ── For each album: fetch detail page, then create product ───────────
     let catCreated = 0;
     let catSkipped = 0;
     let catErrors = 0;
 
-    for (const productBatch of products) {
+    for (let j = 0; j < albums.length; j++) {
+      const album = albums[j];
       const productStart = Date.now();
       try {
-        // Duplicate guard: skip if a product with this exact name already exists
-        const isDuplicate = await productNameExists(productBatch.name);
-        if (isDuplicate) {
-          clog.productSkipped(category, productBatch.name, 'duplicate');
+        // Duplicate guard FIRST — saves a detail-page fetch for known products
+        if (await productNameExists(album.name)) {
+          clog.productSkipped(category, album.name, 'duplicate');
           result.skipped += 1;
           catSkipped += 1;
           continue;
         }
 
-        // Skip albums with no images (can't create a useful product)
-        if (!productBatch.images || productBatch.images.length === 0) {
-          clog.productSkipped(category, productBatch.name, 'no_images');
+        // Fetch the album detail page to harvest the full image grid.
+        const albumUrl = `${SUPPLIER_BASE_URL}${album.albumPath}`;
+        const albumLabel = `${album.name} [album]`;
+        const detailFetch = await fetchSupplierPage(albumUrl, albumLabel);
+
+        const productBatch = parseAlbumDetail(detailFetch.html);
+        if (!productBatch || !productBatch.images || productBatch.images.length === 0) {
+          clog.productSkipped(category, album.name, 'no_images');
           result.skipped += 1;
           catSkipped += 1;
           continue;
         }
+
+        // Use the listing's title — it's the canonical name as shown in the
+        // category, which is what admins picked from the UI.
+        productBatch.name = album.name;
 
         const { id, imageCount } = await createCrawledProduct(
           productBatch,
@@ -967,7 +956,7 @@ const crawlSelectedCategories = async (
         );
 
         const productDurationMs = Date.now() - productStart;
-        clog.productCreated(category, productBatch.name, {
+        clog.productCreated(category, album.name, {
           id,
           imageCount,
           durationMs: productDurationMs,
@@ -978,16 +967,21 @@ const crawlSelectedCategories = async (
         catCreated += 1;
       } catch (err) {
         catErrors += 1;
-        clog.productFailed(category, productBatch.name, err);
+        clog.productFailed(category, album.name, err);
         result.errors.push({
           category: category.name,
-          product: productBatch.name,
+          product: album.name,
           message: err.message,
           errorType:
             err instanceof AppError
               ? (err.statusCode >= 500 ? 'server_error' : 'client_error')
               : 'unknown',
         });
+      }
+
+      // Polite delay between album-detail fetches inside the same category.
+      if (j < albums.length - 1) {
+        await sleep(randomBetween(CRAWL_DELAY_MIN_MS, CRAWL_DELAY_MAX_MS));
       }
     }
 
@@ -1021,18 +1015,18 @@ const crawlSelectedCategories = async (
 // ─── Categories Public API ────────────────────────────────────────────────────
 
 /**
- * Fetches the raw HTML of the Yupoo categories listing page.
- * (Thin wrapper around fetchYupooPage for backwards compatibility.)
+ * Fetches the raw HTML of the supplier categories listing page.
+ * (Thin wrapper around fetchSupplierPage for backwards compatibility.)
  *
  * @returns {Promise<string>}
  */
 const fetchCategoriesHtml = async () => {
-  const { html } = await fetchYupooPage(CATEGORIES_URL, 'categories');
+  const { html } = await fetchSupplierPage(CATEGORIES_URL, 'categories');
   return html;
 };
 
 /**
- * Returns the Yupoo category tree.
+ * Returns the supplier category tree.
  *
  * Serves the in-memory cache when available (TTL = 1 hour). Forces a fresh
  * fetch when the cache has expired or when `forceRefresh` is true.
@@ -1044,7 +1038,7 @@ const fetchCategoriesHtml = async () => {
 const getCategories = async ({ forceRefresh = false } = {}) => {
   if (!forceRefresh && isCacheValid()) {
     const ageSeconds = Math.round((Date.now() - cache.fetchedAt) / 1_000);
-    logger.debug('[yupooService] Returning cached categories', {
+    logger.debug('[supplierService] Returning cached categories', {
       count: cache.data.length,
       ageSeconds,
     });
@@ -1052,7 +1046,7 @@ const getCategories = async ({ forceRefresh = false } = {}) => {
   }
 
   if (forceRefresh) {
-    logger.info('[yupooService] Force-refresh requested; invalidating cache');
+    logger.info('[supplierService] Force-refresh requested; invalidating cache');
     invalidateCache();
   }
 
@@ -1061,7 +1055,7 @@ const getCategories = async ({ forceRefresh = false } = {}) => {
 
   if (categories.length === 0) {
     logger.warn(
-      '[yupooService] Parsed 0 categories — the Yupoo page structure may have changed'
+      '[supplierService] Parsed 0 categories — the supplier page structure may have changed'
     );
   }
 
@@ -1086,9 +1080,11 @@ module.exports = {
   // Exported for unit-testing only
   _parseCategories: parseCategories,
   _extractCategoryId: extractCategoryId,
-  _parseCategoryPage: parseCategoryPage,
+  _parseAlbumListing: parseAlbumListing,
+  _parseAlbumDetail: parseAlbumDetail,
   _toBigJpgUrl: toBigJpgUrl,
-  _isYupooPhotoUrl: isYupooPhotoUrl,
+  _isSupplierPhotoUrl: isSupplierPhotoUrl,
+  _isAlbumPath: isAlbumPath,
   _extractAlbumTitle: extractAlbumTitle,
   _classifyFetchError: classifyFetchError,
   _FetchErrorType: FetchErrorType,

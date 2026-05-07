@@ -2,9 +2,9 @@
  * Admin Authentication Middleware Tests
  *
  * Verifies that the `protect` + `restrictTo('admin')` middleware chain is
- * correctly applied to the new Yupoo admin endpoints:
+ * correctly applied to the new supplier admin endpoints:
  *
- *   GET  /api/admin/yupoo-categories
+ *   GET  /api/admin/supplier-categories
  *   POST /api/admin/crawl-products
  *
  * Test matrix:
@@ -16,7 +16,7 @@
  *   6. Valid JWT, role=customer → 403 (Access denied)
  *   7. Valid JWT, role=admin    → request proceeds to controller
  *
- * All tests are fully isolated — no real Firestore, no real Yupoo HTTP.
+ * All tests are fully isolated — no real Firestore, no real supplier HTTP.
  */
 
 'use strict';
@@ -84,9 +84,9 @@ jest.mock('firebase-admin', () => {
 });
 
 /**
- * Mock the yupooService so controllers don't perform real HTTP calls.
+ * Mock the supplierService so controllers don't perform real HTTP calls.
  */
-jest.mock('../src/services/yupooService', () => ({
+jest.mock('../src/services/supplierService', () => ({
   getCategories: jest.fn().mockResolvedValue([]),
   getLastFetchedAt: jest.fn().mockReturnValue(new Date().toISOString()),
   crawlSelectedCategories: jest.fn().mockResolvedValue({
@@ -166,7 +166,7 @@ const doRequest = (agent, method, path, body) => {
  * Each endpoint that requires admin auth should be tested with this.
  *
  * @param {string}  method - 'GET' or 'POST'
- * @param {string}  path   - Route path, e.g. '/api/admin/yupoo-categories'
+ * @param {string}  path   - Route path, e.g. '/api/admin/supplier-categories'
  * @param {Function} [body] - Factory returning a valid request body (POST only)
  */
 const sharedAuthTests = (method, path, body) => {
@@ -259,8 +259,8 @@ const sharedAuthTests = (method, path, body) => {
 
 // ─── Test Suites ──────────────────────────────────────────────────────────────
 
-describe('Admin Auth Middleware — GET /api/admin/yupoo-categories', () => {
-  sharedAuthTests('GET', '/api/admin/yupoo-categories');
+describe('Admin Auth Middleware — GET /api/admin/supplier-categories', () => {
+  sharedAuthTests('GET', '/api/admin/supplier-categories');
 });
 
 describe('Admin Auth Middleware — POST /api/admin/crawl-products', () => {
@@ -272,21 +272,21 @@ describe('Admin Auth Middleware — POST /api/admin/crawl-products', () => {
 describe('Admin Auth Middleware — edge cases', () => {
   it('rejects Authorization header without "Bearer " prefix', async () => {
     const res = await request(app)
-      .get('/api/admin/yupoo-categories')
+      .get('/api/admin/supplier-categories')
       .set('Authorization', adminToken); // missing 'Bearer ' prefix
     expect(res.status).toBe(401);
   });
 
   it('rejects empty Authorization header value', async () => {
     const res = await request(app)
-      .get('/api/admin/yupoo-categories')
+      .get('/api/admin/supplier-categories')
       .set('Authorization', '');
     expect(res.status).toBe(401);
   });
 
   it('rejects "Bearer " header with empty token', async () => {
     const res = await request(app)
-      .get('/api/admin/yupoo-categories')
+      .get('/api/admin/supplier-categories')
       .set('Authorization', 'Bearer ');
     expect(res.status).toBe(401);
   });
@@ -298,7 +298,7 @@ describe('Admin Auth Middleware — edge cases', () => {
       { expiresIn: '1h' }
     );
     const res = await request(app)
-      .get('/api/admin/yupoo-categories')
+      .get('/api/admin/supplier-categories')
       .set('Authorization', `Bearer ${rogueToken}`);
     expect(res.status).toBe(401);
   });
@@ -317,7 +317,7 @@ describe('Admin Auth Middleware — edge cases', () => {
       }),
     };
     const res = await request(app)
-      .get('/api/admin/yupoo-categories')
+      .get('/api/admin/supplier-categories')
       .set('Authorization', `Bearer ${managerToken}`);
     currentMockUser = { ...mockUser }; // restore
     expect(res.status).toBe(403);

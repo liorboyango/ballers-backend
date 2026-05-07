@@ -5,7 +5,7 @@
  * public URL on the product document.
  *
  * Also exposes `downloadAndUploadImages()` for bulk-importing images from
- * external URLs (e.g. Yupoo). Each URL is fetched as an arraybuffer, validated
+ * external URLs (e.g. supplier crawls). Each URL is fetched as an arraybuffer, validated
  * (MIME type + size), uploaded to Firebase Storage, and the resulting public
  * URL is returned.
  */
@@ -110,15 +110,35 @@ const uploadProductImageBuffer = async ({ buffer, mimetype, ext = '' }) => {
  * @param {object}  [opts]
  * @param {number}  [opts.maxImages=10]        - Maximum number of images to process
  * @param {number}  [opts.timeoutMs=15000]     - Per-request timeout in milliseconds
+ * @param {string}  [opts.referer]             - Referer header to send (some CDNs
+ *                                               return non-200 without one, e.g. Yupoo's
+ *                                               anti-hotlinking returns HTTP 567)
+ * @param {string}  [opts.userAgent]           - User-Agent override (defaults to a real
+ *                                               browser UA — required for hosts that block
+ *                                               bot identifiers)
  * @returns {Promise<string[]>} Array of Firebase Storage public URLs
  */
 const downloadAndUploadImages = async (imageUrls, opts = {}) => {
-  const { maxImages = 10, timeoutMs = 15000 } = opts;
+  const {
+    maxImages = 10,
+    timeoutMs = 15000,
+    referer,
+    userAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/124.0.0.0 Safari/537.36',
+  } = opts;
   const urls = Array.isArray(imageUrls) ? imageUrls.slice(0, maxImages) : [];
 
   if (urls.length === 0) return [];
 
   const results = [];
+
+  const requestHeaders = {
+    'User-Agent': userAgent,
+    Accept: 'image/*,*/*;q=0.8',
+  };
+  if (referer) requestHeaders.Referer = referer;
 
   for (const url of urls) {
     try {
@@ -129,12 +149,7 @@ const downloadAndUploadImages = async (imageUrls, opts = {}) => {
         timeout: timeoutMs,
         maxContentLength: MAX_EXTERNAL_IMAGE_SIZE,
         maxBodyLength: MAX_EXTERNAL_IMAGE_SIZE,
-        headers: {
-          // Mimic a browser user-agent to avoid simple bot-blocking
-          'User-Agent':
-            'Mozilla/5.0 (compatible; BallersBot/1.0; +https://ballers.app)',
-          Accept: 'image/*,*/*;q=0.8',
-        },
+        headers: requestHeaders,
         validateStatus: (status) => status >= 200 && status < 300,
       });
 

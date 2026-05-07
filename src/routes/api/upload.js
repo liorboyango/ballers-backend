@@ -10,7 +10,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../../middleware/auth');
+const { protect } = require('../../middleware/auth');
 const { upload } = require('../../services/upload');
 const {
   uploadProductImage,
@@ -29,7 +29,7 @@ const {
  */
 router.post(
   '/product-image',
-  authenticate,
+  protect,
   upload.single('image'),
   uploadProductImage
 );
@@ -43,7 +43,7 @@ router.post(
  */
 router.post(
   '/product-images',
-  authenticate,
+  protect,
   upload.array('images', 10),
   uploadProductImages
 );
@@ -65,7 +65,7 @@ router.get('/image-info', getImageInfo);
  * @body    { imageUrl: string }
  * @returns { message, product: { id, imageUrl, cacheControl } }
  */
-router.put('/attach/:productId', authenticate, attachImageToProduct);
+router.put('/attach/:productId', protect, attachImageToProduct);
 
 /**
  * @route   DELETE /api/upload
@@ -74,6 +74,6 @@ router.put('/attach/:productId', authenticate, attachImageToProduct);
  * @query   url - Full Firebase Storage public URL of the image to delete
  * @returns { message, url }
  */
-router.delete('/', authenticate, deleteProductImage);
+router.delete('/', protect, deleteProductImage);
 
 module.exports = router;

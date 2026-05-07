@@ -1,13 +1,13 @@
 /**
- * Unit Tests — Yupoo Service (error handling, parsing, rate limiting, logging)
+ * Unit Tests — Supplier Service (error handling, parsing, rate limiting, logging)
  *
  * These tests cover:
- *   1. HTML parsers (_parseCategories, _parseCategoryPage, _toBigJpgUrl, etc.)
+ *   1. HTML parsers (_parseCategories, _parseAlbumListing, _parseAlbumDetail, _toBigJpgUrl, etc.)
  *   2. Error classification (_classifyFetchError)
  *   3. Exponential backoff (_backoffDelay)
  *   4. Circuit-breaker constant exposed via _CIRCUIT_BREAKER_THRESHOLD
  *   5. Duplicate URL conversion (_toBigJpgUrl)
- *   6. URL validation (_isYupooPhotoUrl)
+ *   6. URL validation (_isSupplierPhotoUrl, _isAlbumPath)
  *
  * No real network or Firestore calls are made — all external dependencies
  * are mocked with jest.mock().
@@ -68,15 +68,17 @@ const axios = require('axios');
 
 const {
   _parseCategories,
-  _parseCategoryPage,
+  _parseAlbumListing,
+  _parseAlbumDetail,
   _toBigJpgUrl,
-  _isYupooPhotoUrl,
+  _isSupplierPhotoUrl,
+  _isAlbumPath,
   _extractCategoryId,
   _classifyFetchError,
   _FetchErrorType,
   _backoffDelay,
   _CIRCUIT_BREAKER_THRESHOLD,
-} = require('../src/services/yupooService');
+} = require('../src/services/supplierService');
 
 // ─── _toBigJpgUrl ─────────────────────────────────────────────────────────────
 
@@ -112,21 +114,53 @@ describe('_toBigJpgUrl', () => {
   });
 });
 
-// ─── _isYupooPhotoUrl ─────────────────────────────────────────────────────────
+// ─── _isSupplierPhotoUrl ──────────────────────────────────────────────────────
 
-describe('_isYupooPhotoUrl', () => {
+describe('_isSupplierPhotoUrl', () => {
   it('accepts photo.yupoo.com URLs', () => {
-    expect(_isYupooPhotoUrl('https://photo.yupoo.com/user/abc/big.jpg')).toBe(true);
+    expect(_isSupplierPhotoUrl('https://photo.yupoo.com/user/abc/big.jpg')).toBe(true);
   });
 
   it('rejects other hostnames', () => {
-    expect(_isYupooPhotoUrl('https://evil.com/image.jpg')).toBe(false);
-    expect(_isYupooPhotoUrl('https://yupoo.com/image.jpg')).toBe(false);
+    expect(_isSupplierPhotoUrl('https://evil.com/image.jpg')).toBe(false);
+    expect(_isSupplierPhotoUrl('https://yupoo.com/image.jpg')).toBe(false);
   });
 
   it('returns false for malformed URLs', () => {
-    expect(_isYupooPhotoUrl('not-a-url')).toBe(false);
-    expect(_isYupooPhotoUrl('')).toBe(false);
+    expect(_isSupplierPhotoUrl('not-a-url')).toBe(false);
+    expect(_isSupplierPhotoUrl('')).toBe(false);
+  });
+});
+
+// ─── _isAlbumPath ─────────────────────────────────────────────────────────────
+
+describe('_isAlbumPath', () => {
+  it('accepts /albums/<digits>', () => {
+    expect(_isAlbumPath('/albums/166889738')).toBe(true);
+  });
+
+  it('accepts /albums/<digits> with query string', () => {
+    expect(_isAlbumPath('/albums/166889738?uid=1&isSubCate=true')).toBe(true);
+  });
+
+  it('rejects non-album paths', () => {
+    expect(_isAlbumPath('/categories/729135')).toBe(false);
+    expect(_isAlbumPath('/')).toBe(false);
+    expect(_isAlbumPath('/albums/')).toBe(false);
+  });
+
+  it('rejects absolute URLs (path-only allowed)', () => {
+    expect(_isAlbumPath('https://evil.com/albums/123')).toBe(false);
+  });
+
+  it('rejects non-numeric album ids', () => {
+    expect(_isAlbumPath('/albums/abc')).toBe(false);
+  });
+
+  it('rejects null / non-string', () => {
+    expect(_isAlbumPath(null)).toBe(false);
+    expect(_isAlbumPath(undefined)).toBe(false);
+    expect(_isAlbumPath(123)).toBe(false);
   });
 });
 
@@ -225,9 +259,82 @@ describe('_parseCategories', () => {
   });
 });
 
-// ─── _parseCategoryPage ───────────────────────────────────────────────────────
+// ─── _parseAlbumListing ───────────────────────────────────────────────────────
 
-describe('_parseCategoryPage', () => {
+describe('_parseAlbumListing', () => {
+  const listingHtml = `
+    <html><body>
+    <ul class="categories__parent">
+      <li class="album__space">
+        <a class="album__main"
+           title="Gremio 26-27 Home Jersey"
+           href="/albums/166889738?uid=1&isSubCate=true">
+          <div class="album__imgwrap">
+            <img class="album__img" data-src="https://photo.yupoo.com/u/cover1/medium.jpg">
+          </div>
+        </a>
+      </li>
+      <li class="album__space">
+        <a class="album__main"
+           title="Atletico MG Away Jersey"
+           href="/albums/166889739?uid=1&isSubCate=true">
+          <div class="album__imgwrap">
+            <img class="album__img" data-src="https://photo.yupoo.com/u/cover2/medium.jpg">
+          </div>
+        </a>
+      </li>
+    </ul>
+    </body></html>
+  `;
+
+  it('extracts every album__main card on the listing page', () => {
+    const result = _parseAlbumListing(listingHtml);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({
+      name: 'Gremio 26-27 Home Jersey',
+      albumPath: '/albums/166889738?uid=1&isSubCate=true',
+    });
+    expect(result[1].name).toBe('Atletico MG Away Jersey');
+  });
+
+  it('returns empty array when no album cards found', () => {
+    expect(_parseAlbumListing('<html><body>nothing here</body></html>')).toEqual([]);
+  });
+
+  it('skips cards with non-/albums/ hrefs', () => {
+    const html = `
+      <a class="album__main" title="Bad" href="https://evil.com/albums/1"></a>
+      <a class="album__main" title="Good" href="/albums/123"></a>
+    `;
+    const result = _parseAlbumListing(html);
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe('Good');
+  });
+
+  it('skips cards with empty title or href', () => {
+    const html = `
+      <a class="album__main" title="" href="/albums/1"></a>
+      <a class="album__main" title="No Href"></a>
+      <a class="album__main" title="Real" href="/albums/2"></a>
+    `;
+    const result = _parseAlbumListing(html);
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe('Real');
+  });
+
+  it('dedupes duplicate hrefs', () => {
+    const html = `
+      <a class="album__main" title="Same" href="/albums/1"></a>
+      <a class="album__main" title="Same" href="/albums/1"></a>
+    `;
+    const result = _parseAlbumListing(html);
+    expect(result).toHaveLength(1);
+  });
+});
+
+// ─── _parseAlbumDetail ────────────────────────────────────────────────────────
+
+describe('_parseAlbumDetail', () => {
   const singleAlbumHtml = `
     <html><body>
     <div class="showalbumheader__main">
@@ -252,16 +359,16 @@ describe('_parseCategoryPage', () => {
     </body></html>
   `;
 
-  it('parses a single album detail page', () => {
-    const result = _parseCategoryPage(singleAlbumHtml);
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe('Gremio 26-27 Home Jersey');
-    expect(result[0].images).toHaveLength(2);
-    expect(result[0].images[0]).toBe('https://photo.yupoo.com/micom0078/bf32fde523/big.jpg');
+  it('parses a single album detail page into a ProductBatch', () => {
+    const result = _parseAlbumDetail(singleAlbumHtml);
+    expect(result).not.toBeNull();
+    expect(result.name).toBe('Gremio 26-27 Home Jersey');
+    expect(result.images).toHaveLength(2);
+    expect(result.images[0]).toBe('https://photo.yupoo.com/micom0078/bf32fde523/big.jpg');
   });
 
-  it('returns empty array when no .showalbumheader__main found', () => {
-    expect(_parseCategoryPage('<html><body></body></html>')).toEqual([]);
+  it('returns null when no .showalbumheader__main found', () => {
+    expect(_parseAlbumDetail('<html><body></body></html>')).toBeNull();
   });
 
   it('converts small/medium src to big.jpg', () => {
@@ -275,12 +382,11 @@ describe('_parseCategoryPage', () => {
         </div>
       </main>
     `;
-    const result = _parseCategoryPage(html);
-    expect(result).toHaveLength(1);
-    expect(result[0].images[0]).toBe('https://photo.yupoo.com/user/abc/big.jpg');
+    const result = _parseAlbumDetail(html);
+    expect(result.images[0]).toBe('https://photo.yupoo.com/user/abc/big.jpg');
   });
 
-  it('skips non-yupoo image URLs', () => {
+  it('skips non-supplier image URLs (returns batch with empty images)', () => {
     const html = `
       <div class="showalbumheader__main">
         <h1><span data-name="Test Product">Test Product</span></h1>
@@ -291,9 +397,9 @@ describe('_parseCategoryPage', () => {
         </div>
       </main>
     `;
-    const result = _parseCategoryPage(html);
-    // product is skipped entirely since no valid images
-    expect(result).toHaveLength(0);
+    const result = _parseAlbumDetail(html);
+    expect(result).not.toBeNull();
+    expect(result.images).toEqual([]);
   });
 
   it('limits images to MAX_IMAGES_PER_PRODUCT (10)', () => {
@@ -308,8 +414,8 @@ describe('_parseCategoryPage', () => {
         <div class="showalbum__children image__main">${images}</div>
       </main>
     `;
-    const result = _parseCategoryPage(html);
-    expect(result[0].images.length).toBeLessThanOrEqual(10);
+    const result = _parseAlbumDetail(html);
+    expect(result.images.length).toBeLessThanOrEqual(10);
   });
 });
 

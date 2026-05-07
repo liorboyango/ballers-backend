@@ -1,12 +1,12 @@
 /**
- * CrawlLogger — Structured progress logger for Yupoo crawl operations.
+ * CrawlLogger — Structured progress logger for supplier crawl operations.
  *
  * Wraps Winston to emit consistently-shaped log entries for each stage of
  * a crawl job: job start/end, per-category fetch/parse/create phases, and
  * per-product upload/write steps.
  *
  * This is NOT a general-purpose utility — it is tightly coupled to the
- * Yupoo crawl workflow. Its primary purpose is to make the crawl observable
+ * supplier crawl workflow. Its primary purpose is to make the crawl observable
  * from log aggregation tools (e.g. Google Cloud Logging) without drowning
  * application logs in ad-hoc `logger.info()` calls.
  *

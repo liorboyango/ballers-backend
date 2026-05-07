@@ -1,13 +1,13 @@
 /**
- * Yupoo Controller
+ * Supplier Controller
  *
- * Handles admin endpoints related to Yupoo category browsing and
+ * Handles admin endpoints related to supplier category browsing and
  * product crawling.
  *
  * Implemented endpoints:
- *   GET  /api/admin/yupoo-categories  — fetch and return the Yupoo category tree.
- *   POST /api/admin/crawl-products    — accept selected category nodes, fetch each
- *                                       category page, parse albums, create products.
+ *   GET  /api/admin/supplier-categories  — fetch and return the supplier category tree.
+ *   POST /api/admin/crawl-products       — accept selected category nodes, fetch each
+ *                                          category page, parse albums, create products.
  */
 
 'use strict';
@@ -19,19 +19,19 @@ const {
   getCategories,
   getLastFetchedAt,
   crawlSelectedCategories,
-} = require('../services/yupooService');
+} = require('../services/supplierService');
 
-// ─── GET /api/admin/yupoo-categories ─────────────────────────────────────────
+// ─── GET /api/admin/supplier-categories ──────────────────────────────────────
 
 /**
- * GET /api/admin/yupoo-categories
+ * GET /api/admin/supplier-categories
  *
- * Fetches the category tree from https://micom0078.x.yupoo.com/categories/,
- * parses the HTML with cheerio, and returns a structured JSON tree.
+ * Fetches the category tree from the configured supplier site, parses the
+ * HTML with cheerio, and returns a structured JSON tree.
  *
  * Query parameters:
  *   refresh (boolean, optional) — pass "true" to bypass the in-memory cache
- *     and force a live re-fetch from Yupoo.
+ *     and force a live re-fetch from the supplier.
  *
  * Response shape:
  * ```json
@@ -40,15 +40,17 @@ const {
  *   "fetchedAt": "2026-05-07T16:00:00.000Z",
  *   "cached": true,
  *   "count": 5,
- *   "data": [
- *     {
- *       "id": "5066922",
- *       "name": "Brasileiro Série A",
- *       "path": "/categories/5066922",
- *       "subcategoryCount": 23,
- *       "subcategories": [ ... ]
- *     }
- *   ]
+ *   "data": {
+ *     "categories": [
+ *       {
+ *         "id": "5066922",
+ *         "name": "Brasileiro Série A",
+ *         "path": "/categories/5066922",
+ *         "subcategoryCount": 23,
+ *         "subcategories": [ ... ]
+ *       }
+ *     ]
+ *   }
  * }
  * ```
  *
@@ -56,11 +58,11 @@ const {
  * @param {import('express').Response} res
  * @param {import('express').NextFunction} next
  */
-exports.getYupooCategories = asyncHandler(async (req, res, next) => {
+exports.getSupplierCategories = asyncHandler(async (req, res, next) => {
   const forceRefresh = req.query.refresh === 'true';
   const t0 = Date.now();
 
-  logger.info('[yupooCtrl] getYupooCategories called', {
+  logger.info('[supplierCtrl] getSupplierCategories called', {
     userId: req.user && req.user.id,
     forceRefresh,
     ip: req.ip,
@@ -72,16 +74,16 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
   try {
     categories = await getCategories({ forceRefresh });
   } catch (err) {
-    // Surface upstream Yupoo errors with a clear 502 rather than a generic 500
+    // Surface upstream supplier errors with a clear 502 rather than a generic 500
     const statusCode = err.statusCode || 502;
-    logger.error('[yupooCtrl] Failed to fetch/parse categories', {
+    logger.error('[supplierCtrl] Failed to fetch/parse categories', {
       error: err.message,
       userId: req.user && req.user.id,
       durationMs: Date.now() - t0,
     });
     return next(
       new AppError(
-        `Unable to fetch categories from Yupoo: ${err.message}`,
+        `Unable to fetch categories from supplier: ${err.message}`,
         statusCode
       )
     );
@@ -91,7 +93,7 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
   const cached = !forceRefresh && fetchedAt === previousFetchedAt && fetchedAt !== null;
   const durationMs = Date.now() - t0;
 
-  logger.info('[yupooCtrl] Returning categories', {
+  logger.info('[supplierCtrl] Returning categories', {
     count: categories.length,
     cached,
     fetchedAt,
@@ -113,8 +115,8 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
 /**
  * POST /api/admin/crawl-products
  *
- * Accepts a list of selected Yupoo category nodes, crawls each category page,
- * parses album/product blocks, and bulk-creates products in Firestore.
+ * Accepts a list of selected supplier category nodes, crawls each category
+ * page, parses album/product blocks, and bulk-creates products in Firestore.
  *
  * Request body:
  * ```json
@@ -177,7 +179,7 @@ exports.crawlProducts = asyncHandler(async (req, res, next) => {
   const userId = req.user && req.user.id;
   const t0 = Date.now();
 
-  logger.info('[yupooCtrl] crawlProducts called', {
+  logger.info('[supplierCtrl] crawlProducts called', {
     userId,
     categoryCount: selectedCategories.length,
     defaults,
@@ -195,7 +197,7 @@ exports.crawlProducts = asyncHandler(async (req, res, next) => {
 
   const durationMs = Date.now() - t0;
 
-  logger.info('[yupooCtrl] crawlProducts complete', {
+  logger.info('[supplierCtrl] crawlProducts complete', {
     userId,
     created: result.created,
     skipped: result.skipped,

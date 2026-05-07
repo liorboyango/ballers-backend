@@ -9,7 +9,7 @@
  *
  * Notes:
  *  - `imageUrl` is the original single-image field kept for backwards compat.
- *  - `images` is the new multi-image array added for Yupoo bulk import.
+ *  - `images` is the new multi-image array added for supplier bulk import.
  *    When both fields exist, the first element of `images` is used as the
  *    primary display image.
  *  - Existing single-image products continue to work unchanged.

@@ -345,7 +345,7 @@ const getOrdersQuerySchema = Joi.object({
 });
 
 // ─────────────────────────────
-// YUPOO / ADMIN SCHEMAS
+// SUPPLIER / ADMIN SCHEMAS
 // ─────────────────────────────
 
 /**
@@ -449,7 +449,7 @@ module.exports = {
     // Orders
     createOrder: createOrderSchema,
     getOrdersQuery: getOrdersQuerySchema,
-    // Yupoo / Admin
+    // Supplier / Admin
     crawlProducts: crawlProductsSchema,
   },
 };

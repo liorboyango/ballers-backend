@@ -28,6 +28,7 @@ const rateLimit = require('express-rate-limit');
 
 const { errorHandler, notFoundHandler } = require('./middleware/error');
 const logger = require('./utils/logger');
+const { sanitizeInput } = require('./utils/sanitize');
 const { RATE_LIMIT } = require('./utils/constants');
 
 const app = express();
@@ -53,6 +54,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'https://ballers-app.onrender.com',
 ].filter(Boolean);
 
 app.use(
@@ -95,6 +97,23 @@ const globalLimiter = rateLimit({
 
 app.use(globalLimiter);
 
+/**
+ * Stricter limiter for auth endpoints: 10 requests per minute per IP.
+ * Mounted on /api/auth/ to slow down credential-stuffing attempts.
+ */
+const authLimiter = rateLimit({
+  windowMs: RATE_LIMIT.WINDOW_MS,
+  max: RATE_LIMIT.AUTH_MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: 'Too many authentication attempts. Please try again in a minute.',
+  },
+});
+
+app.use('/api/auth/', authLimiter);
+
 // ─── Webhook Routes (MUST be before express.json()) ──────────────────────────
 
 /**
@@ -117,6 +136,9 @@ app.use(express.json({ limit: '10mb' }));
 
 /** Parse URL-encoded form data */
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+/** XSS sanitization — strips HTML/JS from req.body, req.query, req.params */
+app.use(sanitizeInput);
 
 // ─── Compression ─────────────────────────────────────────────────────────────
 
@@ -179,7 +201,7 @@ app.use('/api/upload', require('./routes/api/upload'));
  * Mounted under /api/admin so they are clearly separated from
  * public/user-facing endpoints.
  */
-app.use('/api/admin', require('./routes/api/admin/yupoo'));
+app.use('/api/admin', require('./routes/api/admin/supplier'));
 
 // ─── Error Handling ──────────────────────────────────────────────────────────
 
