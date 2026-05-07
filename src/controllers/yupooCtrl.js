@@ -58,6 +58,7 @@ const {
  */
 exports.getYupooCategories = asyncHandler(async (req, res, next) => {
   const forceRefresh = req.query.refresh === 'true';
+  const t0 = Date.now();
 
   logger.info('[yupooCtrl] getYupooCategories called', {
     userId: req.user && req.user.id,
@@ -67,15 +68,34 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
 
   const previousFetchedAt = getLastFetchedAt();
 
-  const categories = await getCategories({ forceRefresh });
+  let categories;
+  try {
+    categories = await getCategories({ forceRefresh });
+  } catch (err) {
+    // Surface upstream Yupoo errors with a clear 502 rather than a generic 500
+    const statusCode = err.statusCode || 502;
+    logger.error('[yupooCtrl] Failed to fetch/parse categories', {
+      error: err.message,
+      userId: req.user && req.user.id,
+      durationMs: Date.now() - t0,
+    });
+    return next(
+      new AppError(
+        `Unable to fetch categories from Yupoo: ${err.message}`,
+        statusCode
+      )
+    );
+  }
 
   const fetchedAt = getLastFetchedAt();
   const cached = !forceRefresh && fetchedAt === previousFetchedAt && fetchedAt !== null;
+  const durationMs = Date.now() - t0;
 
   logger.info('[yupooCtrl] Returning categories', {
     count: categories.length,
     cached,
     fetchedAt,
+    durationMs,
   });
 
   res.status(200).json({
@@ -83,7 +103,8 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
     fetchedAt,
     cached,
     count: categories.length,
-    data: categories,
+    data: { categories },
+    cachedAt: fetchedAt,
   });
 });
 
@@ -118,9 +139,11 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
  *     "created": 3,
  *     "skipped": 1,
  *     "errors": [
- *       { "category": "Atlético Mineiro", "product": "Jersey Name", "message": "..." }
+ *       { "category": "Atlético Mineiro", "product": "Jersey Name", "message": "...", "errorType": "timeout" }
  *     ],
- *     "ids": ["abc123", "def456", "ghi789"]
+ *     "ids": ["abc123", "def456", "ghi789"],
+ *     "durationMs": 12400,
+ *     "aborted": false
  *   }
  * }
  * ```
@@ -151,8 +174,11 @@ exports.crawlProducts = asyncHandler(async (req, res, next) => {
     );
   }
 
+  const userId = req.user && req.user.id;
+  const t0 = Date.now();
+
   logger.info('[yupooCtrl] crawlProducts called', {
-    userId: req.user && req.user.id,
+    userId,
     categoryCount: selectedCategories.length,
     defaults,
     ip: req.ip,
@@ -160,14 +186,22 @@ exports.crawlProducts = asyncHandler(async (req, res, next) => {
 
   const result = await crawlSelectedCategories(
     selectedCategories,
-    defaults
+    defaults,
+    {
+      userId,
+      // jobId is auto-generated inside crawlSelectedCategories if not provided
+    }
   );
 
+  const durationMs = Date.now() - t0;
+
   logger.info('[yupooCtrl] crawlProducts complete', {
-    userId: req.user && req.user.id,
+    userId,
     created: result.created,
     skipped: result.skipped,
     errors: result.errors.length,
+    aborted: result.aborted,
+    durationMs,
   });
 
   res.status(200).json({
@@ -177,6 +211,8 @@ exports.crawlProducts = asyncHandler(async (req, res, next) => {
       skipped: result.skipped,
       errors: result.errors,
       ids: result.ids,
+      durationMs: result.durationMs,
+      aborted: result.aborted,
     },
   });
 });

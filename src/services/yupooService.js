@@ -8,13 +8,21 @@
  * category page, parses album/product blocks, and creates products via
  * the internal createProduct helper.
  *
+ * Error handling:
+ *   - Network errors are classified by type (timeout, rate_limit, server_error, etc.)
+ *   - Axios errors are wrapped with actionable context before being re-thrown
+ *   - A circuit breaker halts the crawl when too many consecutive category
+ *     failures occur (prevents wasting time & resources on a broken session)
+ *   - Partial image-upload failures on product creation are cleaned up
+ *     automatically to avoid orphaned Storage objects
+ *
  * Caching:
  *   Parsed category results are stored in-memory for CACHE_TTL_MS (1 hour)
  *   to avoid hitting the external Yupoo server on every admin request.
  *
  * Retry logic:
- *   Up to MAX_RETRIES attempts with RETRY_DELAY_MS between each try to
- *   handle transient network errors gracefully.
+ *   Up to MAX_RETRIES attempts with exponential-backoff-plus-jitter between
+ *   tries to handle transient network errors gracefully.
  *
  * Security:
  *   - Only GET requests are made to a hard-coded Yupoo URL (no user input).
@@ -27,13 +35,15 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { admin } = require('./db');
 const Product = require('../models/Product');
-const { downloadAndUploadImages } = require('./upload');
+const { downloadAndUploadImages, deleteProductImages } = require('./upload');
 const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
+const { CrawlLogger } = require('../utils/crawlLogger');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -50,11 +60,15 @@ const FETCH_TIMEOUT_MS = 20_000;
 /** How long (ms) to keep the parsed tree in the in-memory cache. */
 const CACHE_TTL_MS = 60 * 60 * 1_000; // 1 hour
 
-/** How many times to retry a failed fetch before giving up. */
+/**
+ * Retry configuration:
+ *  - MAX_RETRIES: maximum number of attempts (first try + retries)
+ *  - RETRY_BASE_DELAY_MS: base delay; actual delay = base * 2^(attempt-1) + jitter
+ *  - RETRY_MAX_DELAY_MS: cap on the computed backoff delay
+ */
 const MAX_RETRIES = 3;
-
-/** Base delay (ms) between retry attempts (increases linearly). */
-const RETRY_DELAY_MS = 500;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 5_000;
 
 /**
  * Polite crawl delay range (ms). A random value between MIN and MAX is
@@ -62,10 +76,22 @@ const RETRY_DELAY_MS = 500;
  * the Yupoo server.
  */
 const CRAWL_DELAY_MIN_MS = 500;
-const CRAWL_DELAY_MAX_MS = 1_000;
+const CRAWL_DELAY_MAX_MS = 1_200;
 
 /** Maximum images to collect per product album. */
 const MAX_IMAGES_PER_PRODUCT = 10;
+
+/**
+ * Circuit-breaker threshold: if this many consecutive category fetches fail,
+ * the crawl is aborted early with an error entry in the result.
+ */
+const CIRCUIT_BREAKER_THRESHOLD = 5;
+
+/**
+ * HTTP status codes from Yupoo that should NOT be retried
+ * (client errors indicating a permanent failure for this URL).
+ */
+const NON_RETRYABLE_HTTP_STATUSES = new Set([400, 401, 403, 404, 410]);
 
 // ─── In-Memory Category Cache ─────────────────────────────────────────────────
 
@@ -92,7 +118,7 @@ const invalidateCache = () => {
   cache.fetchedAt = null;
 };
 
-// ─── HTTP Helpers ─────────────────────────────────────────────────────────────
+// ─── HTTP / Error Helpers ──────────────────────────────────────────────────────
 
 /**
  * Pauses execution for `ms` milliseconds.
@@ -108,6 +134,90 @@ const randomBetween = (min, max) =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
 /**
+ * Computes the next retry delay using exponential backoff with full jitter.
+ *
+ * Formula: min(cap, random(0, base * 2^attempt))
+ *
+ * @param {number} attempt - The failed attempt number (1-based)
+ * @returns {number} Delay in milliseconds
+ */
+const backoffDelay = (attempt) => {
+  const exponential = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+  const capped = Math.min(exponential, RETRY_MAX_DELAY_MS);
+  // Full-jitter: pick random value between 0 and capped
+  return Math.floor(Math.random() * capped);
+};
+
+/**
+ * Error type classification for Yupoo fetch failures.
+ *
+ * Used in structured log entries and crawl error reports so that operators
+ * can distinguish transient network issues from policy-based blocks.
+ *
+ * @readonly
+ * @enum {string}
+ */
+const FetchErrorType = {
+  TIMEOUT: 'timeout',
+  RATE_LIMITED: 'rate_limited',
+  SERVER_ERROR: 'server_error',
+  CLIENT_ERROR: 'client_error',
+  NETWORK: 'network',
+  INVALID_RESPONSE: 'invalid_response',
+  UNKNOWN: 'unknown',
+};
+
+/**
+ * Classifies an axios (or generic) error into a FetchErrorType value.
+ * Also determines whether the error is retryable.
+ *
+ * Retryable:
+ *   - TIMEOUT           (transient; server may accept on retry)
+ *   - NETWORK           (DNS, connection refused; may be transient)
+ *   - SERVER_ERROR      (5xx; server-side issue that may clear)
+ *   - RATE_LIMITED      (429; only after applying required backoff)
+ *
+ * NOT retryable:
+ *   - CLIENT_ERROR      (4xx except 429; permanent failure for this URL)
+ *   - INVALID_RESPONSE  (unexpected Content-Type; won't improve on retry)
+ *   - UNKNOWN           (not classified; treat as non-retryable for safety)
+ *
+ * @param {Error} err
+ * @returns {{ type: string, retryable: boolean, httpStatus: number|null }}
+ */
+const classifyFetchError = (err) => {
+  // Axios errors have a `.code` property for network-level issues
+  if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+    return { type: FetchErrorType.TIMEOUT, retryable: true, httpStatus: null };
+  }
+
+  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' || err.code === 'EAI_AGAIN') {
+    return { type: FetchErrorType.NETWORK, retryable: true, httpStatus: null };
+  }
+
+  if (err.response) {
+    const status = err.response.status;
+
+    if (status === 429) {
+      return { type: FetchErrorType.RATE_LIMITED, retryable: true, httpStatus: status };
+    }
+    if (status >= 500) {
+      return { type: FetchErrorType.SERVER_ERROR, retryable: true, httpStatus: status };
+    }
+    if (status >= 400) {
+      return { type: FetchErrorType.CLIENT_ERROR, retryable: false, httpStatus: status };
+    }
+  }
+
+  // AppError thrown by fetchYupooPage for unexpected Content-Type
+  if (err instanceof AppError && err.statusCode === 502) {
+    return { type: FetchErrorType.INVALID_RESPONSE, retryable: false, httpStatus: null };
+  }
+
+  return { type: FetchErrorType.UNKNOWN, retryable: false, httpStatus: null };
+};
+
+/**
  * Shared browser-like HTTP headers used for all Yupoo GET requests.
  */
 const BROWSER_HEADERS = {
@@ -117,20 +227,31 @@ const BROWSER_HEADERS = {
     'Chrome/124.0.0.0 Safari/537.36',
   Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.5',
+  'Cache-Control': 'no-cache',
 };
 
 /**
- * Fetches a Yupoo HTML page with retry logic.
+ * Fetches a Yupoo HTML page with exponential-backoff retry logic.
  *
- * @param {string} url - Full URL to fetch
+ * Retries are only applied to retryable error types (see classifyFetchError).
+ * Each retry waits for backoffDelay(attempt) ms before the next attempt.
+ *
+ * @param {string} url   - Full URL to fetch
  * @param {string} [label] - Human-readable label used in log messages
- * @returns {Promise<string>} Raw HTML string
- * @throws {AppError} When all retries are exhausted or a non-HTML response
+ * @param {object} [opts]
+ * @param {CrawlLogger|null} [opts.clog]     - Optional CrawlLogger for detailed retry events
+ * @param {{ id: string, name: string }|null} [opts.category] - Category context for logging
+ * @returns {Promise<{ html: string, bytes: number, attempt: number, durationMs: number }>}
+ * @throws {AppError} When all retries are exhausted or a non-retryable error occurs
  */
-const fetchYupooPage = async (url, label = url) => {
+const fetchYupooPage = async (url, label = url, opts = {}) => {
+  const { clog = null, category = null } = opts;
   let lastError;
+  let lastClassification = null;
+  const fetchStart = Date.now();
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const attemptStart = Date.now();
     try {
       logger.info(`[yupooService] Fetching "${label}" (attempt ${attempt}/${MAX_RETRIES})`, {
         url,
@@ -150,47 +271,85 @@ const fetchYupooPage = async (url, label = url) => {
         );
       }
 
+      const html = response.data;
+      const bytes = typeof html === 'string' ? html.length : 0;
+      const durationMs = Date.now() - attemptStart;
+
       logger.info(`[yupooService] Fetched "${label}" successfully`, {
-        bytes: typeof response.data === 'string' ? response.data.length : 'unknown',
+        bytes,
         attempt,
+        durationMs,
       });
 
-      return response.data;
+      return { html, bytes, attempt, durationMs };
     } catch (err) {
       lastError = err;
+      lastClassification = classifyFetchError(err);
+      const attemptDuration = Date.now() - attemptStart;
 
-      // Do not retry client errors — they won't resolve on retry
-      if (err.response && err.response.status >= 400 && err.response.status < 500) {
+      // Non-retryable errors — stop immediately
+      if (!lastClassification.retryable) {
         logger.error(
-          `[yupooService] Client error (${err.response.status}) fetching "${label}" — not retrying`
+          `[yupooService] Non-retryable error (${lastClassification.type}) ` +
+          `fetching "${label}" after ${attemptDuration}ms — ${err.message}`
+        );
+        break;
+      }
+
+      // Check if we've also hit a Yupoo client-error HTTP code
+      if (
+        lastClassification.httpStatus &&
+        NON_RETRYABLE_HTTP_STATUSES.has(lastClassification.httpStatus)
+      ) {
+        logger.error(
+          `[yupooService] HTTP ${lastClassification.httpStatus} (permanent) ` +
+          `fetching "${label}" — not retrying`
         );
         break;
       }
 
       if (attempt < MAX_RETRIES) {
-        const delay = RETRY_DELAY_MS * attempt;
-        logger.warn(
-          `[yupooService] Fetch attempt ${attempt} failed; retrying in ${delay}ms`,
-          { error: err.message }
-        );
+        const delay = backoffDelay(attempt);
+        const reason = `${lastClassification.type}${
+          lastClassification.httpStatus ? ` (HTTP ${lastClassification.httpStatus})` : ''
+        }: ${err.message}`;
+
+        if (clog && category) {
+          clog.categoryRetrying(category, {
+            attempt,
+            maxAttempts: MAX_RETRIES,
+            delayMs: delay,
+            reason,
+          });
+        } else {
+          logger.warn(
+            `[yupooService] Fetch attempt ${attempt} failed (${lastClassification.type}); ` +
+            `retrying in ${delay}ms — ${err.message}`
+          );
+        }
         await sleep(delay);
       }
     }
   }
 
-  logger.error(`[yupooService] All fetch attempts failed for "${label}"`, {
-    url,
-    error: lastError && lastError.message,
-  });
+  const totalDuration = Date.now() - fetchStart;
+  logger.error(
+    `[yupooService] All fetch attempts failed for "${label}" ` +
+    `(${totalDuration}ms total)`,
+    { url, error: lastError && lastError.message, classification: lastClassification }
+  );
 
   if (lastError instanceof AppError) throw lastError;
 
-  throw new AppError(
-    `Failed to fetch Yupoo page "${label}" after ${MAX_RETRIES} attempts: ${
-      lastError ? lastError.message : 'unknown error'
-    }`,
-    502
-  );
+  const errorType = lastClassification ? lastClassification.type : FetchErrorType.UNKNOWN;
+  const httpStatus = lastClassification ? lastClassification.httpStatus : null;
+
+  const msg =
+    `Failed to fetch Yupoo page "${label}" after ${MAX_RETRIES} attempts ` +
+    `[${errorType}${httpStatus ? ` HTTP ${httpStatus}` : ''}]: ` +
+    (lastError ? lastError.message : 'unknown error');
+
+  throw new AppError(msg, 502);
 };
 
 // ─── Category List Parser ─────────────────────────────────────────────────────
@@ -545,22 +704,44 @@ const IMPORT_DEFAULTS = {
  * Creates a single product document in Firestore for a crawled album.
  *
  * Downloads + uploads images, merges defaults, and writes the document.
- * Returns the created product's Firestore ID.
+ * If the Firestore write fails after images have been uploaded, the uploaded
+ * Storage objects are deleted to prevent orphaned files.
  *
  * @param {ProductBatch} productBatch - { name, images: [externalUrl, ...] }
  * @param {object} [overrideDefaults] - Caller-supplied defaults (price, kitType, etc.)
- * @returns {Promise<string>} New product document ID
+ * @param {CrawlLogger|null} [clog]   - Optional CrawlLogger for structured progress logging
+ * @returns {Promise<{ id: string, imageCount: number }>}
  */
-const createCrawledProduct = async (productBatch, overrideDefaults = {}) => {
+const createCrawledProduct = async (productBatch, overrideDefaults = {}, clog = null) => {
   const { name, images: imageUrls } = productBatch;
 
   const mergedDefaults = { ...IMPORT_DEFAULTS, ...overrideDefaults };
 
-  // Download & upload images to Firebase Storage
-  const storageUrls = await downloadAndUploadImages(imageUrls, {
-    maxImages: MAX_IMAGES_PER_PRODUCT,
-  });
+  // ── Download & upload images ──────────────────────────────────────────────
+  const imageStart = Date.now();
+  let storageUrls = [];
 
+  try {
+    storageUrls = await downloadAndUploadImages(imageUrls, {
+      maxImages: MAX_IMAGES_PER_PRODUCT,
+    });
+  } catch (uploadErr) {
+    // downloadAndUploadImages throws AppError(422) when ALL images fail.
+    // Re-throw as-is; the caller will handle cleanup.
+    throw uploadErr;
+  }
+
+  const imageDurationMs = Date.now() - imageStart;
+
+  if (clog) {
+    clog.imagesUploaded(name, {
+      requested: imageUrls.length,
+      uploaded: storageUrls.length,
+      durationMs: imageDurationMs,
+    });
+  }
+
+  // ── Persist to Firestore ──────────────────────────────────────────────────
   const now = admin.firestore.FieldValue.serverTimestamp();
   const productData = {
     name,
@@ -572,14 +753,34 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}) => {
     updatedAt: now,
   };
 
-  const ref = Product.collection().doc();
-  await ref.set(productData);
+  let ref;
+  try {
+    ref = Product.collection().doc();
+    await ref.set(productData);
+  } catch (writeErr) {
+    // Firestore write failed — clean up the already-uploaded Storage images
+    // to avoid orphaned objects accumulating in the bucket.
+    if (storageUrls.length > 0) {
+      logger.warn(
+        `[yupooService] Firestore write failed for "${name}"; ` +
+        `cleaning up ${storageUrls.length} uploaded image(s)`,
+        { error: writeErr.message }
+      );
+      // Best-effort cleanup (non-blocking; failures are logged inside deleteProductImages)
+      deleteProductImages(storageUrls).catch((cleanupErr) => {
+        logger.error(
+          `[yupooService] Storage cleanup failed for "${name}": ${cleanupErr.message}`
+        );
+      });
+    }
+    throw writeErr;
+  }
 
-  logger.info(`[yupooService] Created product "${name}" (${ref.id}) with ${
-    storageUrls.length
-  } image(s)`);
+  logger.info(
+    `[yupooService] Created product "${name}" (${ref.id}) with ${storageUrls.length} image(s)`
+  );
 
-  return ref.id;
+  return { id: ref.id, imageCount: storageUrls.length };
 };
 
 // ─── Main Crawl Orchestrator ──────────────────────────────────────────────────
@@ -589,14 +790,17 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}) => {
  * @property {string} category - Category id or name
  * @property {string} product  - Product name (if error occurred during product creation)
  * @property {string} message  - Human-readable error description
+ * @property {string} [errorType] - Classified error type for programmatic handling
  */
 
 /**
  * @typedef {Object} CrawlResult
- * @property {number}           created - Number of products successfully created
- * @property {number}           skipped - Number of products skipped (duplicates)
- * @property {CrawlErrorEntry[]} errors - Per-item error details
- * @property {string[]}         ids    - Firestore IDs of created products
+ * @property {number}             created    - Number of products successfully created
+ * @property {number}             skipped    - Number of products skipped (duplicates)
+ * @property {CrawlErrorEntry[]}  errors     - Per-item error details
+ * @property {string[]}           ids        - Firestore IDs of created products
+ * @property {number}             durationMs - Total crawl duration in ms
+ * @property {boolean}            aborted    - true if circuit breaker triggered
  */
 
 /**
@@ -614,41 +818,71 @@ const createCrawledProduct = async (productBatch, overrideDefaults = {}) => {
  *      e. Apply polite crawl delay before next category
  *   2. Return aggregated CrawlResult
  *
+ * Circuit breaker:
+ *   If CIRCUIT_BREAKER_THRESHOLD consecutive category fetches fail, the crawl
+ *   is aborted and the result includes `aborted: true`.
+ *
  * Errors at the category level (fetch failure) are recorded in `errors`
- * and crawling continues with remaining categories.
+ * and crawling continues with remaining categories (unless circuit trips).
  * Errors at the product level are similarly recorded and processing continues.
  *
  * @param {Array<{id: string, name: string, path: string, isSubCate?: boolean}>} selectedCategories
  * @param {object} [defaults={}] - Override default product fields
- * @param {Function} [onProgress] - Optional callback(progressInfo) for real-time updates
+ * @param {object} [crawlOpts={}]
+ * @param {string} [crawlOpts.jobId]  - Job ID for log correlation (auto-generated if omitted)
+ * @param {string} [crawlOpts.userId] - Admin user ID for log correlation
  * @returns {Promise<CrawlResult>}
  */
 const crawlSelectedCategories = async (
   selectedCategories,
   defaults = {},
-  onProgress = null
+  crawlOpts = {}
 ) => {
+  const jobId = crawlOpts.jobId || crypto.randomUUID().slice(0, 8);
+  const userId = crawlOpts.userId || 'unknown';
+  const total = selectedCategories.length;
+
   const result = {
     created: 0,
     skipped: 0,
     errors: [],
     ids: [],
+    durationMs: 0,
+    aborted: false,
   };
 
-  const total = selectedCategories.length;
-  logger.info(`[yupooService] Starting crawl for ${total} category nodes`, {
+  const clog = new CrawlLogger({ jobId, userId, totalCategories: total });
+  const jobStart = Date.now();
+  clog.jobStart();
+
+  logger.info(`[yupooService] Starting crawl job ${jobId} for ${total} category nodes`, {
     defaults,
+    userId,
   });
+
+  let consecutiveFailures = 0;
 
   for (let i = 0; i < selectedCategories.length; i++) {
     const category = selectedCategories[i];
     const categoryLabel = `${category.name} (id=${category.id})`;
+    const categoryStart = Date.now();
 
-    if (onProgress) {
-      onProgress({ current: i + 1, total, category: category.name, phase: 'fetching' });
+    // ── Circuit breaker check ─────────────────────────────────────────────
+    if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+      clog.circuitOpen(consecutiveFailures, CIRCUIT_BREAKER_THRESHOLD);
+      result.errors.push({
+        category: category.name,
+        product: '',
+        message:
+          `Crawl aborted: ${consecutiveFailures} consecutive category failures ` +
+          `exceeded the circuit-breaker threshold (${CIRCUIT_BREAKER_THRESHOLD}).`,
+        errorType: 'circuit_breaker',
+      });
+      result.aborted = true;
+      break;
     }
 
-    logger.info(`[yupooService] Crawling category ${i + 1}/${total}: ${categoryLabel}`);
+    clog.categoryStart(category, i + 1);
 
     // ── Build URL ────────────────────────────────────────────────────────
     let categoryUrl = `${YUPOO_BASE_URL}${category.path}`;
@@ -659,85 +893,126 @@ const crawlSelectedCategories = async (
     // ── Fetch + parse category page ──────────────────────────────────────
     let products;
     try {
-      const html = await fetchYupooPage(categoryUrl, categoryLabel);
-      products = parseCategoryPage(html);
-    } catch (err) {
-      logger.error(`[yupooService] Failed to crawl category "${categoryLabel}"`, {
-        error: err.message,
+      const fetchResult = await fetchYupooPage(categoryUrl, categoryLabel, {
+        clog,
+        category,
       });
+
+      clog.categoryFetched(category, {
+        bytes: fetchResult.bytes,
+        attempt: fetchResult.attempt,
+        durationMs: fetchResult.durationMs,
+      });
+
+      products = parseCategoryPage(fetchResult.html);
+
+      clog.categoryParsed(category, { productCount: products.length });
+
+      // Reset circuit breaker on successful fetch
+      consecutiveFailures = 0;
+    } catch (err) {
+      const classification = classifyFetchError(err);
+      consecutiveFailures += 1;
+
+      clog.categoryFailed(category, err, {
+        errorType: classification.type,
+        retryable: classification.retryable,
+      });
+
       result.errors.push({
         category: category.name,
         product: '',
         message: `Failed to fetch/parse category page: ${err.message}`,
+        errorType: classification.type,
       });
-      // Still apply delay before next request
+
+      // Still apply delay before next request (even on failure)
       await sleep(randomBetween(CRAWL_DELAY_MIN_MS, CRAWL_DELAY_MAX_MS));
       continue;
     }
 
-    logger.info(`[yupooService] Category "${categoryLabel}" yielded ${products.length} product(s)`);
+    logger.info(
+      `[yupooService] Category "${categoryLabel}" yielded ${products.length} product(s)`
+    );
 
     // ── Create products ──────────────────────────────────────────────────
-    for (const productBatch of products) {
-      if (onProgress) {
-        onProgress({
-          current: i + 1,
-          total,
-          category: category.name,
-          phase: 'creating',
-          product: productBatch.name,
-        });
-      }
+    let catCreated = 0;
+    let catSkipped = 0;
+    let catErrors = 0;
 
+    for (const productBatch of products) {
+      const productStart = Date.now();
       try {
         // Duplicate guard: skip if a product with this exact name already exists
         const isDuplicate = await productNameExists(productBatch.name);
         if (isDuplicate) {
-          logger.info(
-            `[yupooService] Skipping duplicate product "${productBatch.name}"`
-          );
+          clog.productSkipped(category, productBatch.name, 'duplicate');
           result.skipped += 1;
+          catSkipped += 1;
           continue;
         }
 
         // Skip albums with no images (can't create a useful product)
         if (!productBatch.images || productBatch.images.length === 0) {
-          logger.warn(
-            `[yupooService] Skipping "${productBatch.name}" — no images found`
-          );
+          clog.productSkipped(category, productBatch.name, 'no_images');
           result.skipped += 1;
+          catSkipped += 1;
           continue;
         }
 
-        const id = await createCrawledProduct(productBatch, defaults);
+        const { id, imageCount } = await createCrawledProduct(
+          productBatch,
+          defaults,
+          clog
+        );
+
+        const productDurationMs = Date.now() - productStart;
+        clog.productCreated(category, productBatch.name, {
+          id,
+          imageCount,
+          durationMs: productDurationMs,
+        });
+
         result.created += 1;
         result.ids.push(id);
+        catCreated += 1;
       } catch (err) {
-        logger.error(
-          `[yupooService] Error creating product "${productBatch.name}"`,
-          { error: err.message, category: category.name }
-        );
+        catErrors += 1;
+        clog.productFailed(category, productBatch.name, err);
         result.errors.push({
           category: category.name,
           product: productBatch.name,
           message: err.message,
+          errorType:
+            err instanceof AppError
+              ? (err.statusCode >= 500 ? 'server_error' : 'client_error')
+              : 'unknown',
         });
       }
     }
 
+    const categoryDurationMs = Date.now() - categoryStart;
+    clog.categoryDone(category, {
+      created: catCreated,
+      skipped: catSkipped,
+      errors: catErrors,
+      durationMs: categoryDurationMs,
+    });
+
     // ── Polite delay before next category request ─────────────────────────
     if (i < selectedCategories.length - 1) {
       const delay = randomBetween(CRAWL_DELAY_MIN_MS, CRAWL_DELAY_MAX_MS);
-      logger.debug(`[yupooService] Polite crawl delay: ${delay}ms`);
+      clog.crawlDelay(delay);
       await sleep(delay);
     }
   }
 
-  logger.info('[yupooService] Crawl complete', {
+  result.durationMs = Date.now() - jobStart;
+  clog.jobDone({
     created: result.created,
     skipped: result.skipped,
     errors: result.errors.length,
-    totalCategories: total,
+    ids: result.ids,
   });
 
   return result;
@@ -751,8 +1026,10 @@ const crawlSelectedCategories = async (
  *
  * @returns {Promise<string>}
  */
-const fetchCategoriesHtml = () =>
-  fetchYupooPage(CATEGORIES_URL, 'categories');
+const fetchCategoriesHtml = async () => {
+  const { html } = await fetchYupooPage(CATEGORIES_URL, 'categories');
+  return html;
+};
 
 /**
  * Returns the Yupoo category tree.
@@ -813,4 +1090,8 @@ module.exports = {
   _toBigJpgUrl: toBigJpgUrl,
   _isYupooPhotoUrl: isYupooPhotoUrl,
   _extractAlbumTitle: extractAlbumTitle,
+  _classifyFetchError: classifyFetchError,
+  _FetchErrorType: FetchErrorType,
+  _backoffDelay: backoffDelay,
+  _CIRCUIT_BREAKER_THRESHOLD: CIRCUIT_BREAKER_THRESHOLD,
 };
