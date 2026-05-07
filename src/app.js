@@ -174,6 +174,13 @@ app.use('/api/cart', require('./routes/api/cart'));
 app.use('/api/orders', require('./routes/api/orders'));
 app.use('/api/upload', require('./routes/api/upload'));
 
+/**
+ * Admin-only routes — all require JWT + admin role.
+ * Mounted under /api/admin so they are clearly separated from
+ * public/user-facing endpoints.
+ */
+app.use('/api/admin', require('./routes/api/admin/yupoo'));
+
 // ─── Error Handling ──────────────────────────────────────────────────────────
 
 /** 404 handler for unmatched routes */
