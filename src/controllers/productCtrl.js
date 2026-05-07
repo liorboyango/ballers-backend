@@ -11,12 +11,21 @@
  *    list responses we batch reads via getAll().
  *  - Product images are stored in Firebase Storage; `imageUrl` on the document
  *    is the public URL we wrote in the upload service.
+ *
+ * Image handling in createProduct:
+ *  - Mode A (manual, existing): req.file → upload to storage → set imageUrl.
+ *    If no file, Gemini auto-generates one (requires teamId).
+ *  - Mode B (bulk import, new): req.body.images (array of URLs) → download
+ *    each URL via downloadAndUploadImages → set images[] on document; teamId
+ *    is optional; Gemini is bypassed entirely.
  */
 const { admin } = require('../services/db');
 const {
   uploadProductImage,
   uploadProductImageBuffer,
   deleteProductImage,
+  deleteProductImages,
+  downloadAndUploadImages,
 } = require('../services/upload');
 const { generateProductImage } = require('../services/imageGen');
 const Product = require('../models/Product');
@@ -128,23 +137,88 @@ exports.getProductById = asyncHandler(async (req, res, next) => {
   res.status(200).json({ status: 'success', data: withTeam });
 });
 
+/**
+ * POST /api/products
+ *
+ * Creates a new product. Supports two image modes:
+ *
+ * **Mode A – manual (existing behaviour):**
+ *   - `req.body.images` is absent/empty
+ *   - If `req.file` is present: upload the file buffer to Storage → set `imageUrl`
+ *   - If no file: generate image via Gemini (requires a valid `teamId`) → set `imageUrl`
+ *
+ * **Mode B – bulk import (new):**
+ *   - `req.body.images` is a non-empty array of external image URLs
+ *   - Each URL is downloaded, validated (MIME + size), and uploaded to Storage
+ *   - The resulting Storage URLs are saved as `images[]` on the document
+ *   - `teamId` is optional (null/omitted is fine)
+ *   - Gemini image generation is completely bypassed
+ *
+ * Defaults applied when fields are omitted (useful for bulk import):
+ *   - kitType: 'home'
+ *   - sizes: ['S', 'M', 'L', 'XL', 'XXL']
+ *   - price: 99.99
+ *   - stock: 10
+ *   - customizable: true
+ */
 exports.createProduct = asyncHandler(async (req, res, next) => {
-  const teamSnap = await Team.collection().doc(req.body.teamId).get();
-  if (!teamSnap.exists) {
-    return next(new AppError('Team not found. Please provide a valid teamId.', 404));
+  const { teamId, images: inputImages, ...rest } = req.body;
+
+  const isBulkImport = Array.isArray(inputImages) && inputImages.length > 0;
+
+  // ── Team validation ──────────────────────────────────────────────────────
+  // In bulk-import mode teamId is optional; skip the lookup if not provided.
+  let teamSnap = null;
+  if (teamId) {
+    teamSnap = await Team.collection().doc(teamId).get();
+    if (!teamSnap.exists) {
+      return next(new AppError('Team not found. Please provide a valid teamId.', 404));
+    }
+  } else if (!isBulkImport) {
+    // Manual mode requires a teamId so Gemini can reference the team
+    return next(
+      new AppError(
+        'teamId is required when not providing an images array.',
+        400
+      )
+    );
   }
 
-  const { teamId, ...rest } = req.body;
   const now = admin.firestore.FieldValue.serverTimestamp();
   const productData = {
     ...rest,
-    team: teamId,
+    team: teamId || null,
     createdAt: now,
     updatedAt: now,
   };
-  if (req.file) {
+
+  // ── Image handling ───────────────────────────────────────────────────────
+  if (isBulkImport) {
+    // ── Mode B: download external URLs and upload to Firebase Storage ──────
+    logger.info(
+      `Bulk import mode: downloading ${inputImages.length} external image(s) for "${productData.name}"`
+    );
+    const t0 = Date.now();
+
+    const storageUrls = await downloadAndUploadImages(inputImages, { maxImages: 10 });
+
+    logger.info(
+      `Bulk import: uploaded ${storageUrls.length}/${inputImages.length} images ` +
+      `for "${productData.name}" in ${Date.now() - t0}ms`
+    );
+
+    productData.images = storageUrls;
+    // Also set imageUrl to the first image for backwards-compatibility with
+    // consumers that only read the legacy imageUrl field.
+    if (storageUrls.length > 0) {
+      productData.imageUrl = storageUrls[0];
+    }
+  } else if (req.file) {
+    // ── Mode A-i: uploaded file ─────────────────────────────────────────────
     productData.imageUrl = await uploadProductImage(req.file);
   } else {
+    // ── Mode A-ii: Gemini auto-generation ──────────────────────────────────
+    // teamSnap is guaranteed non-null here (teamId is required for this path)
     const team = Team.serialize(teamSnap);
     const t0 = Date.now();
     const generated = await generateProductImage({ product: productData, team });
@@ -156,13 +230,15 @@ exports.createProduct = asyncHandler(async (req, res, next) => {
       ext: generated.ext,
     });
     logger.info(
-      `AI-generated image attached for product "${productData.name}" (upload ${Date.now() - t1}ms, total ${Date.now() - t0}ms)`
+      `AI-generated image attached for product "${productData.name}" ` +
+      `(upload ${Date.now() - t1}ms, total ${Date.now() - t0}ms)`
     );
     if (req.aborted || res.writableEnded) {
       logger.warn(`Client disconnected before response for "${productData.name}"`);
     }
   }
 
+  // ── Persist to Firestore ──────────────────────────────────────────────────
   const ref = Product.collection().doc();
   await ref.set(productData);
   const snap = await ref.get();
@@ -224,9 +300,16 @@ exports.deleteProduct = asyncHandler(async (req, res, next) => {
   if (!snap.exists) {
     return next(new AppError('Product not found.', 404));
   }
-  const imageUrl = snap.data().imageUrl;
+  const { imageUrl, images } = snap.data();
   await ref.delete();
+
+  // Clean up all associated storage objects
   if (imageUrl) await deleteProductImage(imageUrl);
+  if (Array.isArray(images) && images.length > 0) {
+    // Filter out the primary imageUrl to avoid double-delete attempts
+    const extraImages = images.filter((u) => u !== imageUrl);
+    if (extraImages.length > 0) await deleteProductImages(extraImages);
+  }
 
   logger.info(`Product deleted: ${req.params.id}`);
 
