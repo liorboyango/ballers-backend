@@ -5,11 +5,17 @@
  * and route registrations. Exported separately from index.js
  * to allow clean testing without starting the HTTP server.
  *
- * IMPORTANT — Stripe webhook route ordering:
- * The /api/stripe/webhook route is registered BEFORE the global
- * express.json() middleware so that the raw request body is preserved
- * for Stripe signature verification. Registering it after express.json()
- * would cause constructEvent() to throw a signature mismatch error.
+ * IMPORTANT — Webhook route ordering:
+ * The /api/stripe/webhook and /api/rapyd/webhook routes are registered
+ * BEFORE the global express.json() middleware so that the raw request
+ * body is preserved for HMAC signature verification. Registering them
+ * after express.json() would cause constructEvent() to throw a signature
+ * mismatch error.
+ *
+ * The Stripe route is retained alongside the Rapyd route during the
+ * Stripe → Rapyd migration so that in-flight Stripe webhook deliveries
+ * continue to be processed until the cutover is complete (see migration
+ * plan in the architecture design).
  */
 
 'use strict';
@@ -90,20 +96,26 @@ const globalLimiter = rateLimit({
 
 app.use(globalLimiter);
 
-// ─── Stripe Webhook Route (MUST be before express.json()) ────────────────────
+// ─── Webhook Routes (MUST be before express.json()) ──────────────────────────
 
 /**
- * Register the Stripe webhook route BEFORE the global JSON body parser.
+ * Register webhook routes BEFORE the global JSON body parser.
  *
- * Stripe's signature verification (stripe.webhooks.constructEvent) requires
+ * Both Stripe (legacy) and Rapyd (current) signature verification require
  * the raw, unparsed request body as a Buffer. If express.json() runs first,
  * it consumes the stream and replaces req.body with a parsed object, which
- * causes constructEvent() to throw a signature mismatch error.
+ * causes the verification helpers (stripe.webhooks.constructEvent /
+ * rapyd.webhooks.constructEvent) to throw a signature mismatch error.
  *
- * The route itself applies express.raw({ type: 'application/json' }) so that
- * req.body is a Buffer only for this specific endpoint.
+ * Each route module applies express.raw({ type: 'application/json' })
+ * internally so that req.body is a Buffer only for those specific endpoints.
+ *
+ * NOTE: The Stripe route is retained during the Rapyd migration to handle
+ * in-flight deliveries from the legacy provider. It will be removed in the
+ * dedicated Stripe-removal task after cutover.
  */
 app.use('/api/stripe', require('./routes/api/stripe'));
+app.use('/api/rapyd', require('./routes/api/rapyd'));
 
 // ─── Request Parsing ─────────────────────────────────────────────────────────
 
