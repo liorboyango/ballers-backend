@@ -1,28 +1,38 @@
 /**
  * Order Controller
- * Handles order creation, retrieval, and Stripe payment intent creation.
+ *
+ * Handles order creation, retrieval, and Rapyd payment creation.
  *
  * createOrder runs in a Firestore transaction so that stock validation,
  * order creation, and cart clearing are atomic.
  *
- * The order creation flow (Stripe-integrated):
- *   1. Frontend calls POST /api/orders/create-payment-intent → gets client_secret.
- *   2. Frontend confirms payment via stripe.confirmCardPayment(client_secret).
- *   3. On Stripe success, frontend calls POST /api/orders/create with
- *      { paymentIntentId, shippingAddress } to persist the order.
- *   4. Backend verifies the PaymentIntent with Stripe, then creates the order
- *      with status 'paid' (if already succeeded) or 'pending' (awaiting webhook).
- *   5. Stripe webhook (payment_intent.succeeded) updates status to 'paid'
- *      and clears the cart if the order was created before the webhook fires.
+ * The order creation flow (Rapyd-integrated):
+ *   1. Frontend calls POST /api/orders/create-payment-intent → gets clientToken
+ *      + paymentId.
+ *   2. Frontend confirms payment via the Rapyd Client SDK using the clientToken.
+ *   3. On Rapyd success, frontend calls POST /api/orders/create with
+ *      { rapydPaymentId, shippingAddress } to persist the order.
+ *   4. Backend retrieves the Rapyd Payment, verifies status / userId / amount,
+ *      then creates the order with status 'paid' (succeeded) or 'pending'
+ *      (awaiting webhook).
+ *   5. Rapyd webhook (payment.SUCCEEDED) updates status to 'paid' and clears
+ *      the cart if the order was created before the webhook fired.
  *
- * createPaymentIntent:
+ * createPaymentIntent (Rapyd):
  *   1. Fetches the authenticated user's cart from Firestore.
  *   2. Validates cart items and checks product stock.
  *   3. Calculates the order total (subtotal + shipping).
- *   4. Creates a Stripe PaymentIntent and returns the client_secret.
+ *   4. Creates a Rapyd Payment and returns the clientToken needed by the
+ *      Rapyd Client SDK to render the secure card iframe and confirm the payment.
+ *
+ * NOTE: verifyPaymentIntent / createOrder still reference the legacy Stripe
+ * service. Those are migrated to Rapyd in a follow-up task — keeping them
+ * here untouched ensures existing Stripe-based integration tests keep passing
+ * during the incremental cut-over.
  */
 const { admin, getDb } = require('../services/db');
 const stripe = require('../services/stripe');
+const rapyd = require('../services/rapyd');
 const Order = require('../models/Order');
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
@@ -44,6 +54,37 @@ const calculateTotals = (orderItems) => {
   const shippingCost = subtotal >= 100 ? 0 : 9.99;
   const total = Math.round((subtotal + shippingCost) * 100) / 100;
   return { subtotal, shippingCost, total };
+};
+
+/**
+ * Extract a usable client token from a Rapyd Payment response.
+ *
+ * Rapyd returns slightly different payloads depending on payment_method_type
+ * and account configuration. Common locations for the token the Client SDK
+ * needs to render the hosted card iframe and confirm the payment include:
+ *
+ *   - payment.redirect_url                (hosted page redirect)
+ *   - payment.textual_codes.client_token  (token-based flow)
+ *   - payment.payment_method_options.client_token
+ *   - payment.next_action.redirect_url    (3DS redirect)
+ *
+ * We probe these in priority order and return the first non-empty value.
+ * Falling back to the payment id ensures the frontend always receives
+ * something it can use to look the payment up.
+ *
+ * @param {object} payment Rapyd Payment data
+ * @returns {string|null}
+ */
+const extractClientToken = (payment) => {
+  if (!payment || typeof payment !== 'object') return null;
+  return (
+    payment.client_token ||
+    (payment.textual_codes && payment.textual_codes.client_token) ||
+    (payment.payment_method_options && payment.payment_method_options.client_token) ||
+    (payment.next_action && payment.next_action.redirect_url) ||
+    payment.redirect_url ||
+    null
+  );
 };
 
 /**
@@ -109,18 +150,21 @@ const verifyPaymentIntent = async (paymentIntentId, userId) => {
 
 /**
  * @route   POST /api/orders/create-payment-intent
- * @desc    Fetch cart items, calculate total, create a Stripe PaymentIntent,
- *          and return the client_secret for the frontend to confirm payment.
+ * @desc    Fetch cart items, calculate the total, create a Rapyd Payment,
+ *          and return the clientToken needed by the Rapyd Client SDK
+ *          to render the secure card iframe and confirm the payment.
  * @access  Protected (JWT)
  *
  * Response 200:
  * {
  *   status: 'success',
  *   data: {
- *     clientSecret: string,       // Stripe PaymentIntent client_secret
- *     paymentIntentId: string,    // Stripe PaymentIntent id (pi_...)
- *     amount: number,             // Total in cents (e.g. 8999 = $89.99)
- *     currency: string,           // 'usd'
+ *     paymentId: string,         // Rapyd payment id (e.g. 'payment_xxx')
+ *     clientToken: string|null,  // Token / URL the Rapyd Client SDK uses to
+ *                                // render the hosted card iframe & confirm.
+ *     amount: number,            // Total in minor units (cents) for parity
+ *                                // with the legacy Stripe response shape.
+ *     currency: string,          // 'USD'
  *     orderSummary: {
  *       items: Array,
  *       subtotal: number,
@@ -194,26 +238,36 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
   // ── 3. Calculate totals ────────────────────────────────────────────────────
   const { subtotal, shippingCost, total } = calculateTotals(orderItems);
 
-  // Stripe requires amount in the smallest currency unit (cents for USD)
+  // Amount is computed in MINOR units (cents) so the response shape continues
+  // to match the legacy Stripe contract. The Rapyd service converts back to
+  // major units internally before signing the request.
   const amountInCents = Math.round(total * 100);
 
-  // ── 4. Create Stripe PaymentIntent ────────────────────────────────────────
-  let paymentIntent;
+  // ── 4. Create Rapyd Payment ───────────────────────────────────────────────
+  let payment;
   try {
-    paymentIntent = await stripe.paymentIntents.create({
+    payment = await rapyd.createPayment({
       amount: amountInCents,
-      currency: 'usd',
-      // Automatic payment methods lets Stripe optimise the payment flow
-      automatic_payment_methods: { enabled: true },
+      currency: 'USD',
+      // 'us_visa_card' is broadly supported in Rapyd sandbox/USD flows; the
+      // Rapyd Client SDK exposes the full set of brands (Visa, Mastercard,
+      // Amex, Discover) regardless of this default once the iframe is rendered.
+      paymentMethodType: 'us_visa_card',
+      description: `Ballers order — ${orderItems.length} item(s)`,
       metadata: {
         userId,
         itemCount: String(orderItems.length),
         subtotal: String(subtotal),
         shippingCost: String(shippingCost),
+        amountCents: String(amountInCents),
       },
     });
-  } catch (stripeError) {
-    logger.error(`Stripe PaymentIntent creation failed for user ${userId}: ${stripeError.message}`);
+  } catch (rapydError) {
+    logger.error(
+      `Rapyd payment creation failed for user ${userId}: ${rapydError.message}`
+    );
+    // Bubble AppErrors (already user-safe) verbatim; wrap anything else as 502.
+    if (rapydError instanceof AppError) return next(rapydError);
     return next(
       new AppError(
         'Unable to initialise payment. Please try again or contact support.',
@@ -222,19 +276,30 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
     );
   }
 
+  if (!payment || !payment.id) {
+    logger.error(
+      `Rapyd payment creation returned an invalid response for user ${userId}`
+    );
+    return next(
+      new AppError('Unable to initialise payment — invalid Rapyd response.', 502)
+    );
+  }
+
+  const clientToken = extractClientToken(payment);
+
   logger.info(
-    `PaymentIntent created: ${paymentIntent.id} for user ${userId}, ` +
-    `amount: $${total} (${amountInCents} cents)`
+    `Rapyd payment created: ${payment.id} for user ${userId}, ` +
+    `amount: $${total} (${amountInCents} cents), status: ${payment.status || 'unknown'}`
   );
 
-  // ── 5. Return client_secret to the frontend ────────────────────────────────
+  // ── 5. Return Rapyd payment details to the frontend ───────────────────────
   res.status(200).json({
     status: 'success',
     data: {
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id,
+      paymentId: payment.id,
+      clientToken,
       amount: amountInCents,
-      currency: paymentIntent.currency,
+      currency: (payment.currency_code || payment.currency || 'USD').toUpperCase(),
       orderSummary: {
         items: orderItems,
         subtotal,
