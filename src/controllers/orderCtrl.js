@@ -24,14 +24,8 @@
  *   3. Calculates the order total (subtotal + shipping).
  *   4. Creates a Rapyd Payment and returns the clientToken needed by the
  *      Rapyd Client SDK to render the secure card iframe and confirm the payment.
- *
- * NOTE: verifyPaymentIntent / createOrder still reference the legacy Stripe
- * service. Those are migrated to Rapyd in a follow-up task — keeping them
- * here untouched ensures existing Stripe-based integration tests keep passing
- * during the incremental cut-over.
  */
 const { admin, getDb } = require('../services/db');
-const stripe = require('../services/stripe');
 const rapyd = require('../services/rapyd');
 const Order = require('../models/Order');
 const Cart = require('../models/Cart');
@@ -40,7 +34,7 @@ const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 const logger = require('../utils/logger');
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────
 
 /**
  * Calculate order totals from an array of cart items enriched with product data.
@@ -87,27 +81,63 @@ const extractClientToken = (payment) => {
   );
 };
 
+// ───── Rapyd payment status helpers ────────────────────────────
+//
+// Rapyd uses short status codes on the Payment object. Documented values:
+//   'CLO' — Closed (payment captured / completed)
+//   'ACT' — Active (awaiting confirmation, e.g. 3DS in progress, or pending
+//            sync → still acceptable to create the order in 'pending' state)
+//   'NEW' — Newly created, not yet processed
+//   'CAN' — Cancelled
+//   'EXP' — Expired
+//   'ERR' — Errored
+//   'REJ' — Rejected (e.g. card declined)
+// Some sandbox environments also surface the verbose forms
+// 'SUCCEEDED' / 'COMPLETED' / 'ACTIVATED' — we accept those as synonyms.
+
+const RAPYD_TERMINAL_FAILED = new Set(['CAN', 'EXP', 'ERR', 'REJ', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'FAILED']);
+const RAPYD_SUCCESS = new Set(['CLO', 'CLOSED', 'COMPLETED', 'SUCCEEDED', 'PAID']);
+const RAPYD_ACTIVE = new Set(['ACT', 'ACTIVE', 'ACTIVATED', 'NEW', 'PENDING']);
+
 /**
- * Verify a Stripe PaymentIntent and return its data.
+ * Normalise a Rapyd status to one of: 'success' | 'pending' | 'failed' | 'unknown'.
+ * @param {string|undefined|null} status
+ * @returns {'success'|'pending'|'failed'|'unknown'}
+ */
+const classifyRapydStatus = (status) => {
+  if (!status) return 'unknown';
+  const s = String(status).toUpperCase();
+  if (RAPYD_SUCCESS.has(s)) return 'success';
+  if (RAPYD_TERMINAL_FAILED.has(s)) return 'failed';
+  if (RAPYD_ACTIVE.has(s)) return 'pending';
+  return 'unknown';
+};
+
+/**
+ * Verify a Rapyd Payment and return its data.
  *
  * Validates that:
- *   - The PaymentIntent exists in Stripe.
+ *   - The Rapyd Payment exists.
  *   - It belongs to the authenticated user (via metadata.userId).
- *   - Its status is either 'succeeded' or 'requires_capture' (valid for order creation).
- *     A status of 'canceled' or 'payment_failed' is rejected.
+ *   - Its status is acceptable for order creation: success ('CLO'/'CLOSED'/'COMPLETED')
+ *     or pending ('ACT'/'NEW'). Terminal failure statuses ('CAN', 'REJ', 'EXP', 'ERR')
+ *     are rejected.
  *
- * @param {string} paymentIntentId - Stripe PaymentIntent id (pi_...)
- * @param {string} userId - Authenticated user id
- * @returns {Promise<import('stripe').Stripe.PaymentIntent>}
- * @throws {AppError} on invalid/mismatched/failed PaymentIntent
+ * Amount/currency are also returned so the controller can perform an
+ * exact-match check against the cart-derived total before persisting the order.
+ *
+ * @param {string} rapydPaymentId Rapyd payment id (e.g. 'payment_xxx')
+ * @param {string} userId Authenticated user id
+ * @returns {Promise<object>} The Rapyd Payment data
+ * @throws {AppError} on invalid/mismatched/failed Payment
  */
-const verifyPaymentIntent = async (paymentIntentId, userId) => {
-  let paymentIntent;
+const verifyRapydPayment = async (rapydPaymentId, userId) => {
+  let payment;
   try {
-    paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    payment = await rapyd.retrievePayment(rapydPaymentId);
   } catch (err) {
     logger.warn(
-      `Failed to retrieve PaymentIntent ${paymentIntentId} for user ${userId}: ${err.message}`
+      `Failed to retrieve Rapyd payment ${rapydPaymentId} for user ${userId}: ${err.message}`
     );
     throw new AppError(
       'Payment verification failed. The payment reference is invalid or could not be found.',
@@ -115,12 +145,22 @@ const verifyPaymentIntent = async (paymentIntentId, userId) => {
     );
   }
 
-  // Guard: ensure the PaymentIntent belongs to this user
-  if (paymentIntent.metadata && paymentIntent.metadata.userId) {
-    if (paymentIntent.metadata.userId !== userId) {
+  if (!payment || typeof payment !== 'object' || !payment.id) {
+    logger.warn(
+      `Rapyd payment ${rapydPaymentId} returned an empty/invalid envelope for user ${userId}`
+    );
+    throw new AppError(
+      'Payment verification failed. Rapyd returned an invalid response.',
+      400
+    );
+  }
+
+  // Guard: ensure the Payment belongs to this user (via metadata)
+  if (payment.metadata && payment.metadata.userId) {
+    if (payment.metadata.userId !== userId) {
       logger.warn(
-        `PaymentIntent ${paymentIntentId} userId mismatch: ` +
-        `expected ${userId}, got ${paymentIntent.metadata.userId}`
+        `Rapyd payment ${rapydPaymentId} userId mismatch: ` +
+        `expected ${userId}, got ${payment.metadata.userId}`
       );
       throw new AppError(
         'Payment verification failed. This payment does not belong to your account.',
@@ -129,24 +169,24 @@ const verifyPaymentIntent = async (paymentIntentId, userId) => {
     }
   }
 
-  // Guard: reject terminal failure/cancellation statuses
-  const rejectedStatuses = ['canceled', 'requires_payment_method'];
-  if (rejectedStatuses.includes(paymentIntent.status)) {
+  // Guard: reject terminal failure / cancellation statuses
+  const verdict = classifyRapydStatus(payment.status);
+  if (verdict === 'failed') {
     logger.warn(
-      `PaymentIntent ${paymentIntentId} has invalid status '${paymentIntent.status}' ` +
+      `Rapyd payment ${rapydPaymentId} has terminal status '${payment.status}' ` +
       `for order creation (user: ${userId})`
     );
     throw new AppError(
-      `Cannot create an order for a payment with status '${paymentIntent.status}'. ` +
+      `Cannot create an order for a payment with status '${payment.status}'. ` +
       'Please complete the payment process before placing your order.',
       400
     );
   }
 
-  return paymentIntent;
+  return payment;
 };
 
-// ─── Controllers ─────────────────────────────────────────────────────────────
+// ─── Controllers ─────────────────────────────────────
 
 /**
  * @route   POST /api/orders/create-payment-intent
@@ -178,7 +218,7 @@ const verifyPaymentIntent = async (paymentIntentId, userId) => {
 exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
   const userId = req.user.id;
 
-  // ── 1. Fetch cart ──────────────────────────────────────────────────────────
+  // ── 1. Fetch cart ────────────────────────────────────────────
   const cartSnap = await Cart.docForUser(userId).get();
 
   if (!cartSnap.exists || !(cartSnap.data().items || []).length) {
@@ -189,7 +229,7 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
 
   const cartItems = cartSnap.data().items;
 
-  // ── 2. Fetch product data and validate stock ───────────────────────────────
+  // ── 2. Fetch product data and validate stock ───────────────────────────
   const productRefs = cartItems.map((it) => Product.collection().doc(it.product));
   const productSnaps = await getDb().getAll(...productRefs);
 
@@ -235,7 +275,7 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // ── 3. Calculate totals ────────────────────────────────────────────────────
+  // ── 3. Calculate totals ─────────────────────────────────────────
   const { subtotal, shippingCost, total } = calculateTotals(orderItems);
 
   // Amount is computed in MINOR units (cents) so the response shape continues
@@ -243,7 +283,7 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
   // major units internally before signing the request.
   const amountInCents = Math.round(total * 100);
 
-  // ── 4. Create Rapyd Payment ───────────────────────────────────────────────
+  // ── 4. Create Rapyd Payment ─────────────────────────────────────
   let payment;
   try {
     payment = await rapyd.createPayment({
@@ -311,31 +351,35 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
   });
 });
 
-// ─── Existing Controllers ─────────────────────────────────────────────────────
+// ─── Existing Controllers ───────────────────────────────────────
 
 /**
  * @route   POST /api/orders/create
- * @desc    Create a new order from the user's cart, associated with a Stripe PaymentIntent.
+ * @desc    Create a new order from the user's cart, associated with a verified
+ *          Rapyd Payment.
  *
  *          Flow:
- *          1. Validate the Stripe PaymentIntent (must exist, belong to user, not cancelled).
- *          2. Check for duplicate orders (idempotency — same paymentIntentId).
+ *          1. Validate the Rapyd Payment (must exist, belong to user, not failed/cancelled).
+ *          2. Check for duplicate orders (idempotency — same rapydPaymentId).
  *          3. Run a Firestore transaction to:
  *             a. Validate cart is non-empty.
  *             b. Validate product stock.
- *             c. Create the order document with paymentIntentId.
- *             d. Clear the user's cart.
+ *             c. Validate the Rapyd payment amount matches the cart total.
+ *             d. Create the order document with rapydPaymentId.
+ *             e. Clear the user's cart.
  *          4. Return the created order.
  *
  *          The initial order status is set to:
- *          - 'paid'    — if the PaymentIntent status is 'succeeded' (payment already confirmed)
- *          - 'pending' — otherwise (webhook will update to 'paid' on confirmation)
+ *          - 'paid'    — if the Rapyd Payment status is success ('CLO', 'CLOSED',
+ *                        'COMPLETED', 'SUCCEEDED'); the payment is already captured.
+ *          - 'pending' — otherwise (the webhook will update to 'paid' when Rapyd
+ *                        emits payment.SUCCEEDED).
  *
  * @access  Protected (JWT)
  *
  * Request body:
  * {
- *   paymentIntentId: string,   // Stripe PaymentIntent id (pi_...)
+ *   rapydPaymentId: string,    // Rapyd payment id (payment_...)
  *   shippingAddress: {
  *     firstName, lastName, email, address, city, postalCode, country, phone?
  *   },
@@ -350,7 +394,8 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
  *     orderId: string,
  *     orderNumber: string,
  *     status: 'pending' | 'paid',
- *     paymentIntentId: string,
+ *     rapydPaymentId: string,
+ *     paymentMethod: 'rapyd',
  *     items: Array,
  *     subtotal: number,
  *     shippingCost: number,
@@ -361,28 +406,28 @@ exports.createPaymentIntent = asyncHandler(async (req, res, next) => {
  * }
  */
 exports.createOrder = asyncHandler(async (req, res, next) => {
-  const { shippingAddress, paymentIntentId, notes } = req.body;
+  const { shippingAddress, rapydPaymentId, notes } = req.body;
   const userId = req.user.id;
   const db = getDb();
 
-  // ── 1. Verify the Stripe PaymentIntent ────────────────────────────────────
-  let paymentIntent;
+  // ── 1. Verify the Rapyd Payment ────────────────────────────────────
+  let payment;
   try {
-    paymentIntent = await verifyPaymentIntent(paymentIntentId, userId);
+    payment = await verifyRapydPayment(rapydPaymentId, userId);
   } catch (err) {
     return next(err);
   }
 
   logger.info(
-    `Order creation: PaymentIntent ${paymentIntentId} verified for user ${userId} ` +
-    `(status: ${paymentIntent.status})`
+    `Order creation: Rapyd payment ${rapydPaymentId} verified for user ${userId} ` +
+    `(status: ${payment.status})`
   );
 
   // ── 2. Idempotency check — prevent duplicate orders ────────────────────────
-  // If an order already exists for this PaymentIntent, return it instead of
+  // If an order already exists for this Rapyd payment, return it instead of
   // creating a duplicate. This handles frontend retries gracefully.
   const existingOrderSnap = await Order.collection()
-    .where('paymentIntentId', '==', paymentIntentId)
+    .where('rapydPaymentId', '==', rapydPaymentId)
     .limit(1)
     .get();
 
@@ -390,7 +435,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     const existingOrder = Order.serialize(existingOrderSnap.docs[0]);
     logger.info(
       `Idempotency: order ${existingOrder.id} already exists for ` +
-      `PaymentIntent ${paymentIntentId}. Returning existing order.`
+      `Rapyd payment ${rapydPaymentId}. Returning existing order.`
     );
     return res.status(200).json({
       status: 'success',
@@ -399,7 +444,8 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
         orderId: existingOrder.id,
         orderNumber: existingOrder.orderNumber,
         status: existingOrder.status,
-        paymentIntentId: existingOrder.paymentIntentId,
+        rapydPaymentId: existingOrder.rapydPaymentId,
+        paymentMethod: existingOrder.paymentMethod,
         items: existingOrder.items,
         subtotal: existingOrder.subtotal,
         shippingCost: existingOrder.shippingCost,
@@ -410,11 +456,12 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     });
   }
 
-  // ── 3. Determine initial order status from PaymentIntent ──────────────────
-  // If Stripe has already confirmed the payment (e.g., the webhook fired before
-  // the frontend called this endpoint), set status to 'paid' immediately.
-  // Otherwise, set to 'pending' and let the webhook update it.
-  const initialStatus = paymentIntent.status === 'succeeded' ? 'paid' : 'pending';
+  // ── 3. Determine initial order status from Rapyd Payment ───────────────────
+  // If Rapyd has already settled the payment (status 'CLO'/'CLOSED'/...) we
+  // mark the order 'paid' immediately. Otherwise we mark 'pending' and let
+  // the webhook update it once Rapyd sends payment.SUCCEEDED.
+  const verdict = classifyRapydStatus(payment.status);
+  const initialStatus = verdict === 'success' ? 'paid' : 'pending';
 
   // ── 4. Firestore transaction: validate cart, create order, clear cart ──────
   const cartRef = Cart.docForUser(userId);
@@ -469,6 +516,26 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     const subtotal = orderItems.reduce((sum, it) => sum + it.price * it.quantity, 0);
     const shippingCost = subtotal >= 100 ? 0 : 9.99;
     const total = Math.round((subtotal + shippingCost) * 100) / 100;
+
+    // ── 4b. Amount exact-match check ──────────────────────────────────
+    // Compare in minor units (cents) to avoid floating-point drift.
+    // Rapyd returns `amount` in MAJOR units (e.g. 19.99) so multiply by 100.
+    const expectedCents = Math.round(total * 100);
+    const rapydAmount = Number(payment.amount);
+    if (Number.isFinite(rapydAmount)) {
+      const paymentCents = Math.round(rapydAmount * 100);
+      if (paymentCents !== expectedCents) {
+        logger.warn(
+          `Rapyd payment ${rapydPaymentId} amount mismatch for user ${userId}: ` +
+          `payment=${paymentCents} cents, cart=${expectedCents} cents`
+        );
+        throw new AppError(
+          'Payment amount does not match the cart total. Please refresh your cart and try again.',
+          400
+        );
+      }
+    }
+
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     const orderData = {
@@ -476,9 +543,9 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       orderNumber: Order.generateOrderNumber(),
       items: orderItems,
       shippingAddress,
-      // paymentMethod is always 'stripe' when paymentIntentId is provided
-      paymentMethod: 'stripe',
-      paymentIntentId,
+      // paymentMethod is always 'rapyd' for Rapyd-integrated orders
+      paymentMethod: 'rapyd',
+      rapydPaymentId,
       notes: notes || '',
       subtotal: Math.round(subtotal * 100) / 100,
       shippingCost,
@@ -490,11 +557,8 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
 
     tx.set(orderRef, orderData);
 
-    // Clear the cart only if the payment has already succeeded.
-    // If status is 'pending', the webhook handler will clear the cart
-    // when it receives the payment_intent.succeeded event.
-    // However, we clear it here too to provide immediate UX feedback —
-    // the webhook will handle the case where the cart is already empty.
+    // Clear the cart immediately for snappier UX. The webhook handler is
+    // idempotent and tolerates an already-empty cart.
     tx.update(cartRef, { items: [], updatedAt: now });
 
     return orderData;
@@ -506,7 +570,7 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
   logger.info(
     `Order created: ${order.id} (${order.orderNumber}) for user ${userId}, ` +
     `total: $${result.total}, status: ${result.status}, ` +
-    `paymentIntentId: ${paymentIntentId}`
+    `rapydPaymentId: ${rapydPaymentId}`
   );
 
   res.status(201).json({
@@ -516,7 +580,8 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
       orderId: order.id,
       orderNumber: order.orderNumber,
       status: order.status,
-      paymentIntentId: order.paymentIntentId,
+      rapydPaymentId: order.rapydPaymentId,
+      paymentMethod: order.paymentMethod,
       items: order.items,
       subtotal: order.subtotal,
       shippingCost: order.shippingCost,
