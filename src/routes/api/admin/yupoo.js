@@ -6,9 +6,14 @@
  *   2. The user to have the `admin` role (`restrictTo('admin')` middleware)
  *
  * Routes:
- *   GET /api/admin/yupoo-categories
+ *   GET  /api/admin/yupoo-categories
  *     Fetch the Yupoo category tree (main categories + subcategories).
  *     Supports ?refresh=true to bypass the server-side 1-hour cache.
+ *
+ *   POST /api/admin/crawl-products
+ *     Accept selected category nodes, crawl each category page, parse
+ *     album/product blocks, and bulk-create products in Firestore.
+ *     Body: { selectedCategories: CategoryNode[], defaults?: ProductDefaults }
  *
  * Rate limiting:
  *   A dedicated, stricter limiter (5 requests / minute / IP) is applied to
@@ -21,6 +26,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { protect, restrictTo } = require('../../../middleware/auth');
+const { validate, schemas } = require('../../../middleware/validation');
 const yupooCtrl = require('../../../controllers/yupooCtrl');
 
 const router = express.Router();
@@ -61,5 +67,43 @@ router.use(protect, restrictTo('admin'));
  * @returns {502} Upstream Yupoo fetch failed
  */
 router.get('/yupoo-categories', yupooLimiter, yupooCtrl.getYupooCategories);
+
+/**
+ * @route   POST /api/admin/crawl-products
+ * @desc    Crawl selected Yupoo categories, parse album/product blocks, and
+ *          bulk-create products in Firestore.
+ *
+ *          Body:
+ *          {
+ *            selectedCategories: [
+ *              { id: string, name: string, path: string, isSubCate?: boolean }
+ *            ],
+ *            defaults?: {
+ *              price?: number,
+ *              kitType?: 'home' | 'away' | 'third' | 'goalkeeper',
+ *              stock?: number,
+ *              sizes?: string[]
+ *            }
+ *          }
+ *
+ * @access  Admin only
+ *
+ * @returns {200} {
+ *   status: 'success',
+ *   data: { created: N, skipped: N, errors: [...], ids: [...] }
+ * }
+ * @returns {400} Validation failure
+ * @returns {401} Unauthenticated
+ * @returns {403} Insufficient privileges
+ * @returns {422} Validation schema error
+ * @returns {429} Rate limit exceeded
+ * @returns {500} Unexpected server error
+ */
+router.post(
+  '/crawl-products',
+  yupooLimiter,
+  validate(schemas.crawlProducts),
+  yupooCtrl.crawlProducts
+);
 
 module.exports = router;

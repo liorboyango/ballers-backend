@@ -314,17 +314,8 @@ const shippingAddressSchema = Joi.object({
  * POST /api/orders/create-payment-intent. The id is verified against the
  * Rapyd API in the controller (status / userId metadata / amount) before
  * the order is created.
- *
- * Rapyd payment ids look like 'payment_' + ~28 alphanumeric chars,
- * but length and exact format can vary across Rapyd account types and
- * sandbox vs production. We allow a generous range here and rely on
- * Rapyd's own retrievePayment() call to be the source of truth.
  */
 const createOrderSchema = Joi.object({
-  /**
-   * Rapyd payment id returned by POST /api/orders/create-payment-intent.
-   * Required — orders cannot be created without a verified payment.
-   */
   rapydPaymentId: Joi.string()
     .pattern(/^payment_[A-Za-z0-9_-]{6,128}$/)
     .required()
@@ -354,6 +345,90 @@ const getOrdersQuerySchema = Joi.object({
 });
 
 // ─────────────────────────────
+// YUPOO / ADMIN SCHEMAS
+// ─────────────────────────────
+
+/**
+ * Sub-schema for a single category node passed to the crawl endpoint.
+ *
+ * A node may be a main category or a subcategory (isSubCate = true).
+ * The `path` field is the URL path segment, e.g. "/categories/729135".
+ */
+const categoryNodeSchema = Joi.object({
+  id: Joi.string()
+    .pattern(/^\d+$/)
+    .required()
+    .messages({
+      'string.pattern.base': 'Category id must be a numeric string',
+      'any.required': 'Category id is required',
+    }),
+  name: Joi.string().min(1).max(200).trim().required().messages({
+    'any.required': 'Category name is required',
+    'string.max': 'Category name cannot exceed 200 characters',
+  }),
+  path: Joi.string()
+    .pattern(/^\/categories\/\d+$/)
+    .required()
+    .messages({
+      'string.pattern.base': 'Category path must match /categories/{numericId}',
+      'any.required': 'Category path is required',
+    }),
+  isSubCate: Joi.boolean().optional().default(false),
+  // Allow (and strip) extra fields that the frontend tree may include
+  subcategories: Joi.array().optional(),
+  subcategoryCount: Joi.number().optional(),
+  itemCount: Joi.number().optional(),
+});
+
+/**
+ * Schema for POST /api/admin/crawl-products
+ *
+ * Body shape:
+ * {
+ *   selectedCategories: CategoryNode[],  // 1–100 items
+ *   defaults?: {
+ *     price?: number,
+ *     kitType?: string,
+ *     stock?: number,
+ *     sizes?: string[]
+ *   }
+ * }
+ */
+const crawlProductsSchema = Joi.object({
+  selectedCategories: Joi.array()
+    .items(categoryNodeSchema)
+    .min(1)
+    .max(100)
+    .required()
+    .messages({
+      'array.min': 'At least one category must be selected',
+      'array.max': 'Cannot crawl more than 100 categories in a single request',
+      'any.required': 'selectedCategories is required',
+    }),
+  defaults: Joi.object({
+    price: Joi.number().positive().precision(2).optional().messages({
+      'number.positive': 'Default price must be a positive number',
+    }),
+    kitType: Joi.string()
+      .valid('home', 'away', 'third', 'goalkeeper')
+      .optional()
+      .messages({
+        'any.only': 'kitType must be one of: home, away, third, goalkeeper',
+      }),
+    stock: Joi.number().integer().min(0).optional(),
+    sizes: Joi.array()
+      .items(Joi.string().valid('XS', 'S', 'M', 'L', 'XL', 'XXL'))
+      .min(1)
+      .optional()
+      .messages({
+        'array.min': 'At least one size must be provided',
+      }),
+  })
+    .optional()
+    .default({}),
+});
+
+// ─────────────────────────────
 // EXPORTS
 // ─────────────────────────────
 
@@ -374,5 +449,7 @@ module.exports = {
     // Orders
     createOrder: createOrderSchema,
     getOrdersQuery: getOrdersQuerySchema,
+    // Yupoo / Admin
+    crawlProducts: crawlProductsSchema,
   },
 };

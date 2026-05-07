@@ -4,16 +4,24 @@
  * Handles admin endpoints related to Yupoo category browsing and
  * product crawling.
  *
- * Currently implemented:
- *   GET /api/admin/yupoo-categories — fetch and return the Yupoo
- *     category tree (main categories + subcategories).
+ * Implemented endpoints:
+ *   GET  /api/admin/yupoo-categories  — fetch and return the Yupoo category tree.
+ *   POST /api/admin/crawl-products    — accept selected category nodes, fetch each
+ *                                       category page, parse albums, create products.
  */
 
 'use strict';
 
 const asyncHandler = require('../utils/asyncHandler');
+const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
-const { getCategories, getLastFetchedAt } = require('../services/yupooService');
+const {
+  getCategories,
+  getLastFetchedAt,
+  crawlSelectedCategories,
+} = require('../services/yupooService');
+
+// ─── GET /api/admin/yupoo-categories ─────────────────────────────────────────
 
 /**
  * GET /api/admin/yupoo-categories
@@ -23,7 +31,7 @@ const { getCategories, getLastFetchedAt } = require('../services/yupooService');
  *
  * Query parameters:
  *   refresh (boolean, optional) — pass "true" to bypass the in-memory cache
- *     and force a live re-fetch from Yupoo. Defaults to false.
+ *     and force a live re-fetch from Yupoo.
  *
  * Response shape:
  * ```json
@@ -38,22 +46,11 @@ const { getCategories, getLastFetchedAt } = require('../services/yupooService');
  *       "name": "Brasileiro Série A",
  *       "path": "/categories/5066922",
  *       "subcategoryCount": 23,
- *       "subcategories": [
- *         {
- *           "id": "729135",
- *           "name": "Atlético Mineiro",
- *           "path": "/categories/729135",
- *           "isSubCate": true
- *         }
- *       ]
+ *       "subcategories": [ ... ]
  *     }
  *   ]
  * }
  * ```
- *
- * Error responses:
- *   502 — Yupoo fetch failed (network error or unexpected response format)
- *   500 — Unexpected server error
  *
  * @param {import('express').Request}  req
  * @param {import('express').Response} res
@@ -73,8 +70,6 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
   const categories = await getCategories({ forceRefresh });
 
   const fetchedAt = getLastFetchedAt();
-  // If fetchedAt didn't change (same timestamp) and we didn't force a refresh,
-  // the result came from cache.
   const cached = !forceRefresh && fetchedAt === previousFetchedAt && fetchedAt !== null;
 
   logger.info('[yupooCtrl] Returning categories', {
@@ -89,5 +84,99 @@ exports.getYupooCategories = asyncHandler(async (req, res, next) => {
     cached,
     count: categories.length,
     data: categories,
+  });
+});
+
+// ─── POST /api/admin/crawl-products ──────────────────────────────────────────
+
+/**
+ * POST /api/admin/crawl-products
+ *
+ * Accepts a list of selected Yupoo category nodes, crawls each category page,
+ * parses album/product blocks, and bulk-creates products in Firestore.
+ *
+ * Request body:
+ * ```json
+ * {
+ *   "selectedCategories": [
+ *     { "id": "729135", "name": "Atlético Mineiro", "path": "/categories/729135", "isSubCate": true }
+ *   ],
+ *   "defaults": {
+ *     "price":  99.99,
+ *     "kitType": "home",
+ *     "stock":  10,
+ *     "sizes":  ["S", "M", "L", "XL", "XXL"]
+ *   }
+ * }
+ * ```
+ *
+ * Response shape:
+ * ```json
+ * {
+ *   "status": "success",
+ *   "data": {
+ *     "created": 3,
+ *     "skipped": 1,
+ *     "errors": [
+ *       { "category": "Atlético Mineiro", "product": "Jersey Name", "message": "..." }
+ *     ],
+ *     "ids": ["abc123", "def456", "ghi789"]
+ *   }
+ * }
+ * ```
+ *
+ * HTTP status codes:
+ *   200 — Crawl completed (even if some individual items failed — check errors[]).
+ *   400 — Validation failure (selectedCategories missing or empty).
+ *   401 — Not authenticated.
+ *   403 — Not admin.
+ *   429 — Rate limit exceeded.
+ *   500 — Unexpected server error.
+ *
+ * @param {import('express').Request}  req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ */
+exports.crawlProducts = asyncHandler(async (req, res, next) => {
+  const { selectedCategories, defaults = {} } = req.body;
+
+  // Validation is handled by the Joi schema middleware, but we add a runtime
+  // guard here for defence-in-depth.
+  if (!Array.isArray(selectedCategories) || selectedCategories.length === 0) {
+    return next(
+      new AppError(
+        'selectedCategories must be a non-empty array of category objects.',
+        400
+      )
+    );
+  }
+
+  logger.info('[yupooCtrl] crawlProducts called', {
+    userId: req.user && req.user.id,
+    categoryCount: selectedCategories.length,
+    defaults,
+    ip: req.ip,
+  });
+
+  const result = await crawlSelectedCategories(
+    selectedCategories,
+    defaults
+  );
+
+  logger.info('[yupooCtrl] crawlProducts complete', {
+    userId: req.user && req.user.id,
+    created: result.created,
+    skipped: result.skipped,
+    errors: result.errors.length,
+  });
+
+  res.status(200).json({
+    status: 'success',
+    data: {
+      created: result.created,
+      skipped: result.skipped,
+      errors: result.errors,
+      ids: result.ids,
+    },
   });
 });
