@@ -13,29 +13,37 @@
  *     customization: object|null
  *   }>,
  *   shippingAddress: object,   // { firstName, lastName, email, address, city, postalCode, country, phone? }
- *   paymentMethod:   string,   // Always 'stripe' for Stripe-integrated orders
- *   paymentIntentId: string,   // Stripe PaymentIntent id (pi_...) — used for webhook reconciliation
+ *   paymentMethod:   string,   // Always 'rapyd' for Rapyd-integrated orders
+ *   rapydPaymentId:  string,   // Rapyd Payment id (payment_...) — used for webhook reconciliation
  *   status:          string,   // 'pending' | 'paid' | 'payment_failed' | 'processing' | 'shipped' | 'delivered' | 'cancelled'
  *   notes:           string,   // Optional order notes
  *   subtotal:        number,   // Sum of item prices
  *   shippingCost:    number,   // 0 if subtotal >= $100, else $9.99
  *   total:           number,   // subtotal + shippingCost
- *   stripeEventId:   string?,  // Stripe event id from the last webhook that updated this order
+ *   rapydEventId:    string?,  // Rapyd webhook event id from the last webhook that updated this order (audit)
  *   createdAt:       Timestamp,
  *   updatedAt:       Timestamp
  * }
  *
  * Status lifecycle:
- *   pending → paid (via webhook payment_intent.succeeded)
- *   pending → payment_failed (via webhook payment_intent.payment_failed)
+ *   pending → paid             (via Rapyd webhook payment.SUCCEEDED / PAYMENT_COMPLETED)
+ *   pending → payment_failed   (via Rapyd webhook payment.FAILED / PAYMENT_DECLINED / PAYMENT_CANCELED)
  *   paid → processing → shipped → delivered
  *   any → cancelled
  *
  * `orderNumber` is generated in the controller before write
  * (Firestore has no per-save hooks).
  *
- * `paymentIntentId` is indexed in Firestore to allow efficient lookup
- * by the webhook handler (findOrderByPaymentIntent query).
+ * `rapydPaymentId` should be indexed in Firestore to allow efficient lookup
+ * by the webhook handler (findOrderByRapydPaymentId query) and by the
+ * idempotency guard in createOrder.
+ *
+ * Migration note (Stripe → Rapyd):
+ *   The legacy Stripe-integrated fields (`paymentIntentId`, `stripeEventId`,
+ *   `paymentMethod: 'stripe'`) are no longer written by the controllers.
+ *   Documents that pre-date the Rapyd cutover may still carry those fields;
+ *   they are tolerated (Firestore is schemaless) but ignored by all current
+ *   read paths and may be purged by a future backfill job.
  */
 const { getDb } = require('../services/db');
 

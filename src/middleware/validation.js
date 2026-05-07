@@ -37,9 +37,9 @@ const validate = (schema, property = 'body') => {
   };
 };
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 // AUTH SCHEMAS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 /**
  * Schema for POST /api/auth/register
@@ -81,9 +81,9 @@ const loginSchema = Joi.object({
   }),
 });
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 // PRODUCT SCHEMAS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 /**
  * Schema for POST /api/products (create product)
@@ -159,9 +159,9 @@ const objectIdParamSchema = Joi.object({
     }),
 });
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 // CART SCHEMAS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 /**
  * Reusable customization sub-schema
@@ -231,9 +231,9 @@ const removeCartItemSchema = Joi.object({
     }),
 });
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 // ORDER SCHEMAS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 /**
  * Shipping address sub-schema
@@ -283,23 +283,28 @@ const shippingAddressSchema = Joi.object({
 /**
  * Schema for POST /api/orders/create
  *
- * Requires a Stripe PaymentIntent id (pi_...) to associate the order
- * with a verified payment. The paymentIntentId is validated against
- * Stripe in the controller before the order is created.
+ * Requires a Rapyd Payment id (rapydPaymentId) returned by
+ * POST /api/orders/create-payment-intent. The id is verified against the
+ * Rapyd API in the controller (status / userId metadata / amount) before
+ * the order is created.
+ *
+ * Rapyd payment ids look like 'payment_' + ~28 alphanumeric chars,
+ * but length and exact format can vary across Rapyd account types and
+ * sandbox vs production. We allow a generous range here and rely on
+ * Rapyd's own retrievePayment() call to be the source of truth.
  */
 const createOrderSchema = Joi.object({
   /**
-   * Stripe PaymentIntent id returned by POST /api/orders/create-payment-intent.
-   * Must start with 'pi_' and be between 10 and 128 characters.
-   * Required — orders cannot be created without a valid payment reference.
+   * Rapyd payment id returned by POST /api/orders/create-payment-intent.
+   * Required — orders cannot be created without a verified payment.
    */
-  paymentIntentId: Joi.string()
-    .pattern(/^pi_[A-Za-z0-9_]{6,124}$/)
+  rapydPaymentId: Joi.string()
+    .pattern(/^payment_[A-Za-z0-9_-]{6,128}$/)
     .required()
     .messages({
       'string.pattern.base':
-        'paymentIntentId must be a valid Stripe PaymentIntent id (starts with pi_)',
-      'any.required': 'paymentIntentId is required to associate the order with a payment',
+        'rapydPaymentId must be a valid Rapyd payment id (starts with payment_)',
+      'any.required': 'rapydPaymentId is required to associate the order with a payment',
     }),
   shippingAddress: shippingAddressSchema.required().messages({
     'any.required': 'Shipping address is required',
@@ -321,9 +326,9 @@ const getOrdersQuerySchema = Joi.object({
   sort: Joi.string().valid('createdAt', '-createdAt', 'total', '-total').optional(),
 });
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 // EXPORTS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 module.exports = {
   validate,

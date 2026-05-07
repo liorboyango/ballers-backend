@@ -1,19 +1,23 @@
 /**
- * Order Controller Tests
+ * Order Controller Tests (Rapyd integration)
  *
- * Tests for the Stripe-integrated order creation logic:
- *   - createOrder: PaymentIntent verification, idempotency, status mapping
- *   - createOrderSchema: Joi validation for paymentIntentId
- *   - verifyPaymentIntent: status guards and ownership checks
+ *   - createOrderSchema: Joi validation for rapydPaymentId
+ *   - getOrdersQuerySchema: status values
+ *   - Order model: serialize, generateOrderNumber
+ *   - Rapyd payment retrieval / status mapping helpers
+ *   - Idempotency guard logic
+ *   - Total calculation
  *
- * Uses Jest mocks for Stripe, Firestore, and Firebase Admin to avoid
- * real network calls or database writes.
+ * Uses Jest mocks for the Rapyd service, Firestore, and firebase-admin so
+ * tests never touch the real network or database.
  */
 
 'use strict';
 
-// ─── Environment Setup (must be before any require of app modules) ────────────
-process.env.STRIPE_SECRET_KEY = 'sk_test_mock_key_for_testing';
+// ─── Environment Setup (must run before any app modules are required) ────────
+process.env.RAPYD_ACCESS_KEY = 'rak_test_mock_key';
+process.env.RAPYD_SECRET_KEY = 'rsk_test_mock_secret';
+process.env.RAPYD_WEBHOOK_SECRET = 'rwh_test_mock_webhook_secret';
 process.env.FIREBASE_SERVICE_ACCOUNT = JSON.stringify({
   project_id: 'test-project',
   client_email: 'test@test.iam.gserviceaccount.com',
@@ -21,7 +25,7 @@ process.env.FIREBASE_SERVICE_ACCOUNT = JSON.stringify({
 });
 process.env.JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long';
 
-// ─── Mock firebase-admin ──────────────────────────────────────────────────────
+// ─── Mock firebase-admin ─────────────────────────────────────────────────────
 jest.mock('firebase-admin', () => {
   const serverTimestampValue = { _type: 'serverTimestamp' };
   const apps = [{ options: { projectId: 'test-project' } }];
@@ -44,12 +48,13 @@ jest.mock('firebase-admin', () => {
         }),
       }),
     }),
-    runTransaction: async (fn) => fn({
-      get: async () => ({ exists: false, data: () => ({}) }),
-      set: () => {},
-      update: () => {},
-      getAll: async () => [],
-    }),
+    runTransaction: async (fn) =>
+      fn({
+        get: async () => ({ exists: false, data: () => ({}) }),
+        set: () => {},
+        update: () => {},
+        getAll: async () => [],
+      }),
     getAll: async () => [],
   });
 
@@ -70,18 +75,20 @@ jest.mock('firebase-admin', () => {
   };
 });
 
-// ─── Mock stripe service ──────────────────────────────────────────────────────
-const mockStripeRetrieve = jest.fn();
-const mockStripeCreate = jest.fn();
+// ─── Mock Rapyd service ──────────────────────────────────────────────────────
+const mockRapydRetrieve = jest.fn();
+const mockRapydCreate = jest.fn();
+const mockRapydConstructEvent = jest.fn();
 
-jest.mock('../src/services/stripe', () => ({
-  paymentIntents: {
-    retrieve: (...args) => mockStripeRetrieve(...args),
-    create: (...args) => mockStripeCreate(...args),
+jest.mock('../src/services/rapyd', () => ({
+  retrievePayment: (...args) => mockRapydRetrieve(...args),
+  createPayment: (...args) => mockRapydCreate(...args),
+  webhooks: {
+    constructEvent: (...args) => mockRapydConstructEvent(...args),
   },
 }));
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe('createOrderSchema validation', () => {
   const { schemas } = require('../src/middleware/validation');
@@ -97,44 +104,44 @@ describe('createOrderSchema validation', () => {
     country: 'United States',
   };
 
-  it('accepts a valid paymentIntentId with pi_ prefix', () => {
+  it('accepts a valid rapydPaymentId with payment_ prefix', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
+      rapydPaymentId: 'payment_abc123def456ghi789',
       shippingAddress: validAddress,
     });
     expect(error).toBeUndefined();
   });
 
-  it('rejects missing paymentIntentId', () => {
+  it('rejects missing rapydPaymentId', () => {
     const { error } = schema.validate({
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
     const messages = error.details.map((d) => d.message);
-    expect(messages.some((m) => m.includes('paymentIntentId'))).toBe(true);
+    expect(messages.some((m) => m.includes('rapydPaymentId'))).toBe(true);
   });
 
-  it('rejects paymentIntentId without pi_ prefix', () => {
+  it('rejects rapydPaymentId without payment_ prefix', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'ch_3OxABC123def456ghi', // charge id, not payment intent
+      rapydPaymentId: 'pi_3OxABC123def456ghi', // legacy Stripe id — must be rejected
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
     const messages = error.details.map((d) => d.message);
-    expect(messages.some((m) => m.includes('paymentIntentId'))).toBe(true);
+    expect(messages.some((m) => m.includes('rapydPaymentId'))).toBe(true);
   });
 
-  it('rejects empty paymentIntentId', () => {
+  it('rejects empty rapydPaymentId', () => {
     const { error } = schema.validate({
-      paymentIntentId: '',
+      rapydPaymentId: '',
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
   });
 
-  it('rejects paymentIntentId that is too short', () => {
+  it('rejects rapydPaymentId that is too short', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'pi_abc', // too short (< 10 chars total)
+      rapydPaymentId: 'payment_abc', // less than 6 chars after prefix
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
@@ -142,7 +149,7 @@ describe('createOrderSchema validation', () => {
 
   it('accepts optional notes field', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
+      rapydPaymentId: 'payment_abc123def456ghi789',
       shippingAddress: validAddress,
       notes: 'Please leave at door',
     });
@@ -151,32 +158,40 @@ describe('createOrderSchema validation', () => {
 
   it('rejects notes exceeding 500 characters', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
+      rapydPaymentId: 'payment_abc123def456ghi789',
       shippingAddress: validAddress,
       notes: 'x'.repeat(501),
     });
     expect(error).toBeDefined();
   });
 
-  it('rejects legacy paymentMethod field (no longer accepted)', () => {
-    const { error } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
-      shippingAddress: validAddress,
-      paymentMethod: 'card', // old field — should be stripped/rejected
-    });
-    // stripUnknown: true means it's stripped, not rejected — no error expected
-    // but paymentMethod should not appear in validated value
-    const { value } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
-      shippingAddress: validAddress,
-      paymentMethod: 'card',
-    }, { stripUnknown: true });
+  it('strips legacy paymentMethod field (no longer accepted)', () => {
+    const { value } = schema.validate(
+      {
+        rapydPaymentId: 'payment_abc123def456ghi789',
+        shippingAddress: validAddress,
+        paymentMethod: 'card', // legacy — should be stripped
+      },
+      { stripUnknown: true }
+    );
     expect(value.paymentMethod).toBeUndefined();
+  });
+
+  it('strips legacy paymentIntentId field (no longer accepted)', () => {
+    const { value } = schema.validate(
+      {
+        rapydPaymentId: 'payment_abc123def456ghi789',
+        shippingAddress: validAddress,
+        paymentIntentId: 'pi_legacy_stripe_id', // Stripe legacy
+      },
+      { stripUnknown: true }
+    );
+    expect(value.paymentIntentId).toBeUndefined();
   });
 
   it('rejects missing shippingAddress', () => {
     const { error } = schema.validate({
-      paymentIntentId: 'pi_3OxABC123def456ghi',
+      rapydPaymentId: 'payment_abc123def456ghi789',
     });
     expect(error).toBeDefined();
     const messages = error.details.map((d) => d.message);
@@ -219,7 +234,6 @@ describe('Order model', () => {
 
   it('generates unique order numbers', () => {
     const nums = new Set(Array.from({ length: 100 }, () => Order.generateOrderNumber()));
-    // With timestamp + random, collisions should be extremely rare
     expect(nums.size).toBeGreaterThan(90);
   });
 
@@ -234,7 +248,8 @@ describe('Order model', () => {
       id: 'order123',
       data: () => ({
         user: 'user456',
-        paymentIntentId: 'pi_test123',
+        rapydPaymentId: 'payment_test123',
+        paymentMethod: 'rapyd',
         status: 'paid',
         total: 89.99,
       }),
@@ -243,92 +258,111 @@ describe('Order model', () => {
     expect(result).toEqual({
       id: 'order123',
       user: 'user456',
-      paymentIntentId: 'pi_test123',
+      rapydPaymentId: 'payment_test123',
+      paymentMethod: 'rapyd',
       status: 'paid',
       total: 89.99,
     });
   });
 });
 
-describe('Stripe PaymentIntent verification logic', () => {
+describe('Rapyd Payment verification logic', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  it('retrieves a valid PaymentIntent from Stripe', async () => {
-    mockStripeRetrieve.mockResolvedValueOnce({
-      id: 'pi_test123',
-      status: 'succeeded',
+  it('retrieves a valid Payment from Rapyd', async () => {
+    mockRapydRetrieve.mockResolvedValueOnce({
+      id: 'payment_test123',
+      status: 'CLO',
+      amount: 99.99,
+      currency: 'USD',
       metadata: { userId: 'user456' },
     });
 
-    const stripe = require('../src/services/stripe');
-    const pi = await stripe.paymentIntents.retrieve('pi_test123');
+    const rapyd = require('../src/services/rapyd');
+    const payment = await rapyd.retrievePayment('payment_test123');
 
-    expect(pi.id).toBe('pi_test123');
-    expect(pi.status).toBe('succeeded');
-    expect(mockStripeRetrieve).toHaveBeenCalledWith('pi_test123');
+    expect(payment.id).toBe('payment_test123');
+    expect(payment.status).toBe('CLO');
+    expect(mockRapydRetrieve).toHaveBeenCalledWith('payment_test123');
   });
 
-  it('throws when Stripe retrieve fails', async () => {
-    mockStripeRetrieve.mockRejectedValueOnce(new Error('No such payment_intent'));
+  it('throws when Rapyd retrieve fails', async () => {
+    mockRapydRetrieve.mockRejectedValueOnce(new Error('Rapyd: payment not found'));
 
-    const stripe = require('../src/services/stripe');
-    await expect(stripe.paymentIntents.retrieve('pi_invalid')).rejects.toThrow(
-      'No such payment_intent'
+    const rapyd = require('../src/services/rapyd');
+    await expect(rapyd.retrievePayment('payment_invalid')).rejects.toThrow(
+      /payment not found/i
     );
   });
 
-  it('maps succeeded PaymentIntent to paid order status', () => {
-    const paymentIntent = { status: 'succeeded' };
-    const initialStatus = paymentIntent.status === 'succeeded' ? 'paid' : 'pending';
-    expect(initialStatus).toBe('paid');
+  // Mirrors the classifyRapydStatus helper in the controller.
+  const classify = (status) => {
+    const SUCCESS = new Set(['CLO', 'CLOSED', 'COMPLETED', 'SUCCEEDED', 'PAID']);
+    const PENDING = new Set(['ACT', 'ACTIVE', 'ACTIVATED', 'NEW', 'PENDING']);
+    const FAILED = new Set([
+      'CAN', 'EXP', 'ERR', 'REJ',
+      'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'FAILED',
+    ]);
+    if (!status) return 'unknown';
+    const s = String(status).toUpperCase();
+    if (SUCCESS.has(s)) return 'success';
+    if (FAILED.has(s)) return 'failed';
+    if (PENDING.has(s)) return 'pending';
+    return 'unknown';
+  };
+
+  it('maps CLO Rapyd status to success → paid order', () => {
+    expect(classify('CLO')).toBe('success');
   });
 
-  it('maps requires_action PaymentIntent to pending order status', () => {
-    const paymentIntent = { status: 'requires_action' };
-    const initialStatus = paymentIntent.status === 'succeeded' ? 'paid' : 'pending';
-    expect(initialStatus).toBe('pending');
+  it('maps SUCCEEDED Rapyd status to success', () => {
+    expect(classify('SUCCEEDED')).toBe('success');
   });
 
-  it('maps processing PaymentIntent to pending order status', () => {
-    const paymentIntent = { status: 'processing' };
-    const initialStatus = paymentIntent.status === 'succeeded' ? 'paid' : 'pending';
-    expect(initialStatus).toBe('pending');
+  it('maps ACT Rapyd status to pending → pending order', () => {
+    expect(classify('ACT')).toBe('pending');
   });
 
-  it('identifies rejected PaymentIntent statuses', () => {
-    const rejectedStatuses = ['canceled', 'requires_payment_method'];
-    expect(rejectedStatuses.includes('canceled')).toBe(true);
-    expect(rejectedStatuses.includes('requires_payment_method')).toBe(true);
-    expect(rejectedStatuses.includes('succeeded')).toBe(false);
-    expect(rejectedStatuses.includes('processing')).toBe(false);
-    expect(rejectedStatuses.includes('requires_action')).toBe(false);
+  it('maps NEW Rapyd status to pending', () => {
+    expect(classify('NEW')).toBe('pending');
+  });
+
+  it('maps REJ/CAN/EXP/ERR to failed', () => {
+    expect(classify('REJ')).toBe('failed');
+    expect(classify('CAN')).toBe('failed');
+    expect(classify('EXP')).toBe('failed');
+    expect(classify('ERR')).toBe('failed');
+  });
+
+  it('returns unknown for unrecognised statuses', () => {
+    expect(classify('SOMETHING_ELSE')).toBe('unknown');
+    expect(classify(undefined)).toBe('unknown');
   });
 });
 
-describe('Order creation idempotency', () => {
-  it('returns existing order when paymentIntentId already used', () => {
-    // Simulate the idempotency check logic
+describe('Order creation idempotency (rapydPaymentId)', () => {
+  it('returns existing order when rapydPaymentId already used', () => {
     const existingOrders = [
-      { id: 'order123', paymentIntentId: 'pi_test123', status: 'paid' },
+      { id: 'order123', rapydPaymentId: 'payment_test123', status: 'paid' },
     ];
 
-    const paymentIntentId = 'pi_test123';
-    const found = existingOrders.find((o) => o.paymentIntentId === paymentIntentId);
+    const rapydPaymentId = 'payment_test123';
+    const found = existingOrders.find((o) => o.rapydPaymentId === rapydPaymentId);
 
     expect(found).toBeDefined();
     expect(found.id).toBe('order123');
     expect(found.status).toBe('paid');
   });
 
-  it('proceeds with new order when paymentIntentId is unique', () => {
+  it('proceeds with new order when rapydPaymentId is unique', () => {
     const existingOrders = [
-      { id: 'order123', paymentIntentId: 'pi_test123', status: 'paid' },
+      { id: 'order123', rapydPaymentId: 'payment_test123', status: 'paid' },
     ];
 
-    const paymentIntentId = 'pi_new456';
-    const found = existingOrders.find((o) => o.paymentIntentId === paymentIntentId);
+    const rapydPaymentId = 'payment_new456';
+    const found = existingOrders.find((o) => o.rapydPaymentId === rapydPaymentId);
 
     expect(found).toBeUndefined();
   });
@@ -336,9 +370,8 @@ describe('Order creation idempotency', () => {
 
 describe('Order total calculation', () => {
   const calculateTotals = (orderItems) => {
-    const subtotal = Math.round(
-      orderItems.reduce((sum, it) => sum + it.price * it.quantity, 0) * 100
-    ) / 100;
+    const subtotal =
+      Math.round(orderItems.reduce((sum, it) => sum + it.price * it.quantity, 0) * 100) / 100;
     const shippingCost = subtotal >= 100 ? 0 : 9.99;
     const total = Math.round((subtotal + shippingCost) * 100) / 100;
     return { subtotal, shippingCost, total };

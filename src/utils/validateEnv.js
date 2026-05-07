@@ -34,28 +34,44 @@ const OPTIONAL_ENV_VARS = [
 ];
 
 /**
- * Stripe-related environment variables.
- * These are not strictly required at startup (the app can run without
- * payment features), but a warning is emitted so operators know they
- * need to configure them before enabling checkout.
+ * Rapyd-related environment variables.
+ *
+ * These are not strictly required at startup (the app can boot without
+ * payment features), but a warning is emitted so operators know they need
+ * to configure them before enabling checkout. RAPYD_WEBHOOK_URL is also
+ * surfaced because Rapyd's HMAC signature includes the webhook URL — a
+ * missing/incorrect value will silently break webhook delivery.
+ *
+ * Note: the legacy STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET variables
+ * have been removed in the Rapyd cutover.
  */
-const STRIPE_ENV_VARS = [
+const RAPYD_ENV_VARS = [
   {
-    name: 'STRIPE_SECRET_KEY',
+    name: 'RAPYD_ACCESS_KEY',
     description:
-      'Stripe secret API key (sk_test_... or sk_live_...). Required for payment processing.',
+      'Rapyd access key from the Client Portal (Developers → Credential Details). Required for payment processing.',
   },
   {
-    name: 'STRIPE_WEBHOOK_SECRET',
+    name: 'RAPYD_SECRET_KEY',
     description:
-      'Stripe webhook signing secret (whsec_...). Required for verifying webhook events.',
+      'Rapyd secret key used for HMAC request signing. Required for payment processing.',
+  },
+  {
+    name: 'RAPYD_WEBHOOK_SECRET',
+    description:
+      'Rapyd webhook signing secret. Required for verifying inbound webhook events at /api/rapyd/webhook.',
+  },
+  {
+    name: 'RAPYD_WEBHOOK_URL',
+    description:
+      'Public URL of the webhook endpoint as configured in the Rapyd dashboard. Required for HMAC signature verification.',
   },
 ];
 
 /**
  * Validates all required environment variables are present.
  * Throws an error listing all missing variables if any are absent.
- * Emits console warnings for missing Stripe variables.
+ * Emits console warnings for missing Rapyd variables.
  *
  * @throws {Error} If any required environment variables are missing
  */
@@ -78,17 +94,17 @@ function validateEnv() {
     }
   });
 
-  // Warn about missing Stripe configuration (non-fatal at startup)
-  const missingStripe = STRIPE_ENV_VARS.filter(({ name }) => !process.env[name]);
-  if (missingStripe.length > 0) {
-    const details = missingStripe
+  // Warn about missing Rapyd configuration (non-fatal at startup)
+  const missingRapyd = RAPYD_ENV_VARS.filter(({ name }) => !process.env[name]);
+  if (missingRapyd.length > 0) {
+    const details = missingRapyd
       .map(({ name, description }) => `  - ${name}: ${description}`)
       .join('\n');
     console.warn(
-      `[WARNING] Missing Stripe environment variables (payment features will be unavailable):\n${details}\n` +
+      `[WARNING] Missing Rapyd environment variables (payment features will be unavailable):\n${details}\n` +
         `Please add them to your .env file. See .env.example for guidance.`
     );
   }
 }
 
-module.exports = { validateEnv, REQUIRED_ENV_VARS, OPTIONAL_ENV_VARS, STRIPE_ENV_VARS };
+module.exports = { validateEnv, REQUIRED_ENV_VARS, OPTIONAL_ENV_VARS, RAPYD_ENV_VARS };
