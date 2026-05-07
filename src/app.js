@@ -4,6 +4,12 @@
  * Creates and configures the Express app with all middleware
  * and route registrations. Exported separately from index.js
  * to allow clean testing without starting the HTTP server.
+ *
+ * IMPORTANT — Stripe webhook route ordering:
+ * The /api/stripe/webhook route is registered BEFORE the global
+ * express.json() middleware so that the raw request body is preserved
+ * for Stripe signature verification. Registering it after express.json()
+ * would cause constructEvent() to throw a signature mismatch error.
  */
 
 'use strict';
@@ -83,6 +89,21 @@ const globalLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
+
+// ─── Stripe Webhook Route (MUST be before express.json()) ────────────────────
+
+/**
+ * Register the Stripe webhook route BEFORE the global JSON body parser.
+ *
+ * Stripe's signature verification (stripe.webhooks.constructEvent) requires
+ * the raw, unparsed request body as a Buffer. If express.json() runs first,
+ * it consumes the stream and replaces req.body with a parsed object, which
+ * causes constructEvent() to throw a signature mismatch error.
+ *
+ * The route itself applies express.raw({ type: 'application/json' }) so that
+ * req.body is a Buffer only for this specific endpoint.
+ */
+app.use('/api/stripe', require('./routes/api/stripe'));
 
 // ─── Request Parsing ─────────────────────────────────────────────────────────
 
