@@ -310,19 +310,20 @@ const shippingAddressSchema = Joi.object({
 /**
  * Schema for POST /api/orders/create
  *
- * Requires a Rapyd Payment id (rapydPaymentId) returned by
- * POST /api/orders/create-payment-intent. The id is verified against the
- * Rapyd API in the controller (status / userId metadata / amount) before
+ * Requires an Airwallex Payment Intent id (airwallexPaymentIntentId) returned
+ * by POST /api/orders/create-payment-intent. The id is verified against the
+ * Airwallex API in the controller (status / userId metadata / amount) before
  * the order is created.
  */
 const createOrderSchema = Joi.object({
-  rapydPaymentId: Joi.string()
-    .pattern(/^payment_[A-Za-z0-9_-]{6,128}$/)
+  airwallexPaymentIntentId: Joi.string()
+    .pattern(/^int_[A-Za-z0-9_-]{6,128}$/)
     .required()
     .messages({
       'string.pattern.base':
-        'rapydPaymentId must be a valid Rapyd payment id (starts with payment_)',
-      'any.required': 'rapydPaymentId is required to associate the order with a payment',
+        'airwallexPaymentIntentId must be a valid Airwallex payment intent id (starts with int_)',
+      'any.required':
+        'airwallexPaymentIntentId is required to associate the order with a payment',
     }),
   shippingAddress: shippingAddressSchema.required().messages({
     'any.required': 'Shipping address is required',
@@ -330,6 +331,88 @@ const createOrderSchema = Joi.object({
   notes: Joi.string().max(500).trim().optional().allow('').messages({
     'string.max': 'Order notes cannot exceed 500 characters',
   }),
+});
+
+/**
+ * Shipping address sub-schema for the Hosted Checkout flow.
+ *
+ * Identical to shippingAddressSchema except the postal/ZIP field is named
+ * `zip` (matching what the frontend's CheckoutForm sends) rather than
+ * `postalCode`. The controller maps `zip` → `postalCode` before persisting so
+ * the stored order shape stays consistent with the rest of the system.
+ */
+const checkoutShippingAddressSchema = Joi.object({
+  firstName: Joi.string().min(1).max(50).trim().required().messages({
+    'any.required': 'First name is required',
+    'string.max': 'First name cannot exceed 50 characters',
+  }),
+  lastName: Joi.string().min(1).max(50).trim().required().messages({
+    'any.required': 'Last name is required',
+    'string.max': 'Last name cannot exceed 50 characters',
+  }),
+  email: Joi.string().email().lowercase().trim().required().messages({
+    'string.email': 'Please provide a valid email address',
+    'any.required': 'Email is required',
+  }),
+  address: Joi.string().min(5).max(200).trim().required().messages({
+    'string.min': 'Address must be at least 5 characters',
+    'string.max': 'Address cannot exceed 200 characters',
+    'any.required': 'Address is required',
+  }),
+  city: Joi.string().min(2).max(100).trim().required().messages({
+    'string.min': 'City must be at least 2 characters',
+    'any.required': 'City is required',
+  }),
+  zip: Joi.string()
+    .pattern(/^[A-Z0-9\s\-]{3,10}$/i)
+    .trim()
+    .required()
+    .messages({
+      'string.pattern.base': 'Please provide a valid postal/ZIP code',
+      'any.required': 'ZIP code is required',
+    }),
+  country: Joi.string().min(2).max(100).trim().required().messages({
+    'any.required': 'Country is required',
+  }),
+  phone: Joi.string()
+    .pattern(/^[\+]?[\d\s\-\(\)]{7,20}$/)
+    .optional()
+    .allow('')
+    .messages({
+      'string.pattern.base': 'Please provide a valid phone number',
+    }),
+});
+
+/**
+ * Schema for POST /api/orders/create-checkout-session
+ *
+ * Reads the authenticated user's cart server-side, so only the shipping address
+ * (and optional notes) are accepted from the client.
+ */
+const createCheckoutSessionSchema = Joi.object({
+  shippingAddress: checkoutShippingAddressSchema.required().messages({
+    'any.required': 'Shipping address is required',
+  }),
+  notes: Joi.string().max(500).trim().optional().allow('').messages({
+    'string.max': 'Order notes cannot exceed 500 characters',
+  }),
+});
+
+/**
+ * Schema for POST /api/orders/finalize-checkout
+ *
+ * checkoutId is the Airwallex Payment Intent id (int_...) returned by
+ * create-checkout-session and appended to the return URL by Airwallex.
+ */
+const finalizeCheckoutSchema = Joi.object({
+  checkoutId: Joi.string()
+    .pattern(/^int_[A-Za-z0-9_-]{6,128}$/)
+    .required()
+    .messages({
+      'string.pattern.base':
+        'checkoutId must be a valid Airwallex payment intent id (starts with int_)',
+      'any.required': 'checkoutId is required to finalize the checkout',
+    }),
 });
 
 /**
@@ -448,6 +531,8 @@ module.exports = {
     removeCartItem: removeCartItemSchema,
     // Orders
     createOrder: createOrderSchema,
+    createCheckoutSession: createCheckoutSessionSchema,
+    finalizeCheckout: finalizeCheckoutSchema,
     getOrdersQuery: getOrdersQuerySchema,
     // Supplier / Admin
     crawlProducts: crawlProductsSchema,

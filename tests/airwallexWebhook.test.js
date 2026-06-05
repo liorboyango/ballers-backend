@@ -1,12 +1,12 @@
 /**
- * Rapyd Webhook Controller Tests
+ * Airwallex Webhook Controller Tests
  *
- * Tests the POST /api/rapyd/webhook endpoint:
+ * Tests the POST /api/airwallex/webhook endpoint:
  * - Signature verification (valid, invalid, missing headers)
- * - PAYMENT_COMPLETED / payment.SUCCEEDED → 'paid', clear cart
- * - PAYMENT_FAILED / payment.FAILED       → 'payment_failed'
+ * - payment_intent.succeeded → 'paid', clear cart
+ * - payment_intent.cancelled → 'payment_failed'
  * - Idempotency (order already in target status)
- * - Missing RAPYD_WEBHOOK_SECRET configuration
+ * - Missing AIRWALLEX_WEBHOOK_SECRET configuration
  * - Unhandled event types
  */
 
@@ -16,14 +16,14 @@ const request = require('supertest');
 
 // ─── Mock dependencies BEFORE requiring app ─────────────────────────────────
 
-// Mock rapyd service
+// Mock airwallex service
 const mockConstructEvent = jest.fn();
-jest.mock('../src/services/rapyd', () => ({
+jest.mock('../src/services/airwallex', () => ({
   webhooks: {
     constructEvent: (...args) => mockConstructEvent(...args),
   },
-  createPayment: jest.fn(),
-  retrievePayment: jest.fn(),
+  createPaymentIntent: jest.fn(),
+  retrievePaymentIntent: jest.fn(),
 }));
 
 // Mock Firestore-related shared state
@@ -40,7 +40,7 @@ const mockOrderDoc = {
   data: jest.fn(() => ({
     user: 'user-abc',
     status: 'pending',
-    rapydPaymentId: 'payment_test_123',
+    airwallexPaymentIntentId: 'int_test_123',
   })),
 };
 
@@ -124,9 +124,9 @@ beforeAll(() => {
     token_uri: 'https://oauth2.googleapis.com/token',
   });
   process.env.JWT_SECRET = 'test-jwt-secret-at-least-32-characters-long';
-  process.env.RAPYD_ACCESS_KEY = 'rak_test_access_key';
-  process.env.RAPYD_SECRET_KEY = 'rsk_test_secret_key';
-  process.env.RAPYD_WEBHOOK_SECRET = 'rwh_test_webhook_secret';
+  process.env.AIRWALLEX_CLIENT_ID = 'test_client_id';
+  process.env.AIRWALLEX_API_KEY = 'test_api_key';
+  process.env.AIRWALLEX_WEBHOOK_SECRET = 'awx_test_webhook_secret';
   process.env.NODE_ENV = 'test';
 
   app = require('../src/app');
@@ -138,22 +138,24 @@ afterEach(() => {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-const buildPaymentEvent = (type, overrides = {}) => ({
+const buildPaymentEvent = (name, overrides = {}) => ({
   id: 'evt_test_001',
-  type,
+  name,
   data: {
-    id: 'payment_test_123',
-    status: 'CLO',
-    amount: 99.99,
-    currency: 'USD',
-    metadata: { userId: 'user-abc' },
-    ...overrides,
+    object: {
+      id: 'int_test_123',
+      status: 'SUCCEEDED',
+      amount: 99.99,
+      currency: 'USD',
+      metadata: { userId: 'user-abc' },
+      ...overrides,
+    },
   },
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe('POST /api/rapyd/webhook', () => {
+describe('POST /api/airwallex/webhook', () => {
   describe('Signature verification', () => {
     it('returns 400 when the signature cannot be verified', async () => {
       mockConstructEvent.mockImplementation(() => {
@@ -162,37 +164,35 @@ describe('POST /api/rapyd/webhook', () => {
       });
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .set('signature', 'invalid_sig')
-        .set('salt', 'abc')
-        .set('timestamp', String(Math.floor(Date.now() / 1000)))
-        .set('access_key', 'rak_test_access_key')
-        .send(JSON.stringify({ type: 'PAYMENT_COMPLETED' }));
+        .set('x-signature', 'invalid_sig')
+        .set('x-timestamp', String(Date.now()))
+        .send(JSON.stringify({ name: 'payment_intent.succeeded' }));
 
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/signature/i);
     });
 
-    it('returns 500 when RAPYD_WEBHOOK_SECRET is not configured', async () => {
-      const original = process.env.RAPYD_WEBHOOK_SECRET;
-      delete process.env.RAPYD_WEBHOOK_SECRET;
+    it('returns 500 when AIRWALLEX_WEBHOOK_SECRET is not configured', async () => {
+      const original = process.env.AIRWALLEX_WEBHOOK_SECRET;
+      delete process.env.AIRWALLEX_WEBHOOK_SECRET;
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify({ type: 'PAYMENT_COMPLETED' }));
+        .send(JSON.stringify({ name: 'payment_intent.succeeded' }));
 
       expect(res.status).toBe(500);
       expect(res.body.error).toMatch(/webhook secret not configured/i);
 
-      process.env.RAPYD_WEBHOOK_SECRET = original;
+      process.env.AIRWALLEX_WEBHOOK_SECRET = original;
     });
   });
 
-  describe('PAYMENT_COMPLETED / payment.SUCCEEDED', () => {
+  describe('payment_intent.succeeded', () => {
     beforeEach(() => {
-      mockConstructEvent.mockReturnValue(buildPaymentEvent('PAYMENT_COMPLETED'));
+      mockConstructEvent.mockReturnValue(buildPaymentEvent('payment_intent.succeeded'));
     });
 
     it('returns 200 and updates order status to paid when order exists', async () => {
@@ -205,9 +205,9 @@ describe('POST /api/rapyd/webhook', () => {
       mockCartUpdate.mockResolvedValue({});
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify(buildPaymentEvent('PAYMENT_COMPLETED')));
+        .send(JSON.stringify(buildPaymentEvent('payment_intent.succeeded')));
 
       expect(res.status).toBe(200);
       expect(res.body.received).toBe(true);
@@ -226,7 +226,7 @@ describe('POST /api/rapyd/webhook', () => {
         data: jest.fn(() => ({
           user: 'user-abc',
           status: 'paid',
-          rapydPaymentId: 'payment_test_123',
+          airwallexPaymentIntentId: 'int_test_123',
         })),
       };
 
@@ -236,22 +236,22 @@ describe('POST /api/rapyd/webhook', () => {
       });
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify(buildPaymentEvent('PAYMENT_COMPLETED')));
+        .send(JSON.stringify(buildPaymentEvent('payment_intent.succeeded')));
 
       expect(res.status).toBe(200);
       expect(res.body.received).toBe(true);
       expect(mockOrderUpdate).not.toHaveBeenCalled();
     });
 
-    it('returns 200 when no order is found for the rapydPaymentId', async () => {
+    it('returns 200 when no order is found for the payment intent id', async () => {
       mockOrderGet.mockResolvedValue({ empty: true, docs: [] });
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify(buildPaymentEvent('PAYMENT_COMPLETED')));
+        .send(JSON.stringify(buildPaymentEvent('payment_intent.succeeded')));
 
       expect(res.status).toBe(200);
       expect(res.body.received).toBe(true);
@@ -267,9 +267,9 @@ describe('POST /api/rapyd/webhook', () => {
       mockCartGet.mockResolvedValue({ exists: false });
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify(buildPaymentEvent('PAYMENT_COMPLETED')));
+        .send(JSON.stringify(buildPaymentEvent('payment_intent.succeeded')));
 
       expect(res.status).toBe(200);
       expect(res.body.received).toBe(true);
@@ -277,11 +277,11 @@ describe('POST /api/rapyd/webhook', () => {
     });
   });
 
-  describe('PAYMENT_FAILED / payment.FAILED', () => {
+  describe('payment_intent.cancelled', () => {
     it('returns 200 and updates order status to payment_failed', async () => {
-      const event = buildPaymentEvent('PAYMENT_FAILED', {
-        status: 'REJ',
-        failure_message: 'Card declined',
+      const event = buildPaymentEvent('payment_intent.cancelled', {
+        status: 'CANCELLED',
+        failure_reason: 'Card declined',
       });
       mockConstructEvent.mockReturnValue(event);
 
@@ -292,7 +292,7 @@ describe('POST /api/rapyd/webhook', () => {
       mockOrderUpdate.mockResolvedValue({});
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
         .send(JSON.stringify(event));
 
@@ -304,13 +304,13 @@ describe('POST /api/rapyd/webhook', () => {
     });
 
     it('returns 200 when no order is found for the failed payment', async () => {
-      const event = buildPaymentEvent('PAYMENT_FAILED', { status: 'REJ' });
+      const event = buildPaymentEvent('payment_intent.cancelled', { status: 'CANCELLED' });
       mockConstructEvent.mockReturnValue(event);
 
       mockOrderGet.mockResolvedValue({ empty: true, docs: [] });
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
         .send(JSON.stringify(event));
 
@@ -323,13 +323,13 @@ describe('POST /api/rapyd/webhook', () => {
     it('returns 200 for events the controller does not know about', async () => {
       const event = {
         id: 'evt_002',
-        type: 'PAYOUT_COMPLETED',
-        data: { id: 'payout_123' },
+        name: 'refund.succeeded',
+        data: { object: { id: 'rfd_123' } },
       };
       mockConstructEvent.mockReturnValue(event);
 
       const res = await request(app)
-        .post('/api/rapyd/webhook')
+        .post('/api/airwallex/webhook')
         .set('Content-Type', 'application/json')
         .send(JSON.stringify(event));
 
@@ -342,24 +342,22 @@ describe('POST /api/rapyd/webhook', () => {
 
 // ─── Internal helpers (unit tests for the classifier) ───────────────────────
 
-describe('rapydWebhookCtrl._internal.classifyEventType', () => {
-  const { _internal } = require('../src/controllers/rapydWebhookCtrl');
+describe('airwallexWebhookCtrl._internal.classifyEventType', () => {
+  const { _internal } = require('../src/controllers/airwallexWebhookCtrl');
 
   it('classifies success events', () => {
-    expect(_internal.classifyEventType('PAYMENT_COMPLETED')).toBe('succeeded');
-    expect(_internal.classifyEventType('payment.SUCCEEDED')).toBe('succeeded');
-    expect(_internal.classifyEventType('PAYMENT_CAPTURED')).toBe('succeeded');
+    expect(_internal.classifyEventType('payment_intent.succeeded')).toBe('succeeded');
+    expect(_internal.classifyEventType('payment_intent.captured')).toBe('succeeded');
   });
 
   it('classifies failure events', () => {
-    expect(_internal.classifyEventType('PAYMENT_FAILED')).toBe('failed');
-    expect(_internal.classifyEventType('PAYMENT_DECLINED')).toBe('failed');
-    expect(_internal.classifyEventType('PAYMENT_CANCELED')).toBe('failed');
-    expect(_internal.classifyEventType('payment.FAILED')).toBe('failed');
+    expect(_internal.classifyEventType('payment_intent.cancelled')).toBe('failed');
+    expect(_internal.classifyEventType('payment_intent.failed')).toBe('failed');
+    expect(_internal.classifyEventType('payment_attempt.failed')).toBe('failed');
   });
 
   it('classifies unknown events as unhandled', () => {
-    expect(_internal.classifyEventType('PAYOUT_COMPLETED')).toBe('unhandled');
+    expect(_internal.classifyEventType('refund.succeeded')).toBe('unhandled');
     expect(_internal.classifyEventType('')).toBe('unhandled');
     expect(_internal.classifyEventType(undefined)).toBe('unhandled');
   });

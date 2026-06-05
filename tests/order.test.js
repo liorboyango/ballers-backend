@@ -1,23 +1,23 @@
 /**
- * Order Controller Tests (Rapyd integration)
+ * Order Controller Tests (Airwallex integration)
  *
- *   - createOrderSchema: Joi validation for rapydPaymentId
+ *   - createOrderSchema: Joi validation for airwallexPaymentIntentId
  *   - getOrdersQuerySchema: status values
  *   - Order model: serialize, generateOrderNumber
- *   - Rapyd payment retrieval / status mapping helpers
+ *   - Airwallex payment intent retrieval / status mapping helpers
  *   - Idempotency guard logic
  *   - Total calculation
  *
- * Uses Jest mocks for the Rapyd service, Firestore, and firebase-admin so
+ * Uses Jest mocks for the Airwallex service, Firestore, and firebase-admin so
  * tests never touch the real network or database.
  */
 
 'use strict';
 
 // ─── Environment Setup (must run before any app modules are required) ────────
-process.env.RAPYD_ACCESS_KEY = 'rak_test_mock_key';
-process.env.RAPYD_SECRET_KEY = 'rsk_test_mock_secret';
-process.env.RAPYD_WEBHOOK_SECRET = 'rwh_test_mock_webhook_secret';
+process.env.AIRWALLEX_CLIENT_ID = 'test_client_id';
+process.env.AIRWALLEX_API_KEY = 'test_api_key';
+process.env.AIRWALLEX_WEBHOOK_SECRET = 'awx_test_mock_webhook_secret';
 process.env.FIREBASE_SERVICE_ACCOUNT = JSON.stringify({
   project_id: 'test-project',
   client_email: 'test@test.iam.gserviceaccount.com',
@@ -75,16 +75,16 @@ jest.mock('firebase-admin', () => {
   };
 });
 
-// ─── Mock Rapyd service ──────────────────────────────────────────────────────
-const mockRapydRetrieve = jest.fn();
-const mockRapydCreate = jest.fn();
-const mockRapydConstructEvent = jest.fn();
+// ─── Mock Airwallex service ──────────────────────────────────────────────────
+const mockAirwallexRetrieve = jest.fn();
+const mockAirwallexCreate = jest.fn();
+const mockAirwallexConstructEvent = jest.fn();
 
-jest.mock('../src/services/rapyd', () => ({
-  retrievePayment: (...args) => mockRapydRetrieve(...args),
-  createPayment: (...args) => mockRapydCreate(...args),
+jest.mock('../src/services/airwallex', () => ({
+  retrievePaymentIntent: (...args) => mockAirwallexRetrieve(...args),
+  createPaymentIntent: (...args) => mockAirwallexCreate(...args),
   webhooks: {
-    constructEvent: (...args) => mockRapydConstructEvent(...args),
+    constructEvent: (...args) => mockAirwallexConstructEvent(...args),
   },
 }));
 
@@ -104,44 +104,44 @@ describe('createOrderSchema validation', () => {
     country: 'United States',
   };
 
-  it('accepts a valid rapydPaymentId with payment_ prefix', () => {
+  it('accepts a valid airwallexPaymentIntentId with int_ prefix', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'payment_abc123def456ghi789',
+      airwallexPaymentIntentId: 'int_abc123def456ghi789',
       shippingAddress: validAddress,
     });
     expect(error).toBeUndefined();
   });
 
-  it('rejects missing rapydPaymentId', () => {
+  it('rejects missing airwallexPaymentIntentId', () => {
     const { error } = schema.validate({
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
     const messages = error.details.map((d) => d.message);
-    expect(messages.some((m) => m.includes('rapydPaymentId'))).toBe(true);
+    expect(messages.some((m) => m.includes('airwallexPaymentIntentId'))).toBe(true);
   });
 
-  it('rejects rapydPaymentId without payment_ prefix', () => {
+  it('rejects airwallexPaymentIntentId without int_ prefix', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'pi_3OxABC123def456ghi', // legacy Stripe id — must be rejected
+      airwallexPaymentIntentId: 'payment_legacy_rapyd_id', // legacy id — must be rejected
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
     const messages = error.details.map((d) => d.message);
-    expect(messages.some((m) => m.includes('rapydPaymentId'))).toBe(true);
+    expect(messages.some((m) => m.includes('airwallexPaymentIntentId'))).toBe(true);
   });
 
-  it('rejects empty rapydPaymentId', () => {
+  it('rejects empty airwallexPaymentIntentId', () => {
     const { error } = schema.validate({
-      rapydPaymentId: '',
+      airwallexPaymentIntentId: '',
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
   });
 
-  it('rejects rapydPaymentId that is too short', () => {
+  it('rejects airwallexPaymentIntentId that is too short', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'payment_abc', // less than 6 chars after prefix
+      airwallexPaymentIntentId: 'int_abc', // less than 6 chars after prefix
       shippingAddress: validAddress,
     });
     expect(error).toBeDefined();
@@ -149,7 +149,7 @@ describe('createOrderSchema validation', () => {
 
   it('accepts optional notes field', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'payment_abc123def456ghi789',
+      airwallexPaymentIntentId: 'int_abc123def456ghi789',
       shippingAddress: validAddress,
       notes: 'Please leave at door',
     });
@@ -158,7 +158,7 @@ describe('createOrderSchema validation', () => {
 
   it('rejects notes exceeding 500 characters', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'payment_abc123def456ghi789',
+      airwallexPaymentIntentId: 'int_abc123def456ghi789',
       shippingAddress: validAddress,
       notes: 'x'.repeat(501),
     });
@@ -168,7 +168,7 @@ describe('createOrderSchema validation', () => {
   it('strips legacy paymentMethod field (no longer accepted)', () => {
     const { value } = schema.validate(
       {
-        rapydPaymentId: 'payment_abc123def456ghi789',
+        airwallexPaymentIntentId: 'int_abc123def456ghi789',
         shippingAddress: validAddress,
         paymentMethod: 'card', // legacy — should be stripped
       },
@@ -177,25 +177,24 @@ describe('createOrderSchema validation', () => {
     expect(value.paymentMethod).toBeUndefined();
   });
 
-  it('strips legacy paymentIntentId field (no longer accepted)', () => {
+  it('strips legacy rapydPaymentId field (no longer accepted)', () => {
     const { value } = schema.validate(
       {
-        rapydPaymentId: 'payment_abc123def456ghi789',
+        airwallexPaymentIntentId: 'int_abc123def456ghi789',
         shippingAddress: validAddress,
-        paymentIntentId: 'pi_legacy_stripe_id', // Stripe legacy
+        rapydPaymentId: 'payment_legacy_rapyd_id', // Rapyd legacy
       },
       { stripUnknown: true }
     );
-    expect(value.paymentIntentId).toBeUndefined();
+    expect(value.rapydPaymentId).toBeUndefined();
   });
 
   it('rejects missing shippingAddress', () => {
     const { error } = schema.validate({
-      rapydPaymentId: 'payment_abc123def456ghi789',
+      airwallexPaymentIntentId: 'int_abc123def456ghi789',
     });
     expect(error).toBeDefined();
-    const messages = error.details.map((d) => d.message);
-    expect(messages.some((m) => m.includes('shippingAddress'))).toBe(true);
+    expect(error.details.some((d) => d.path.includes('shippingAddress'))).toBe(true);
   });
 });
 
@@ -248,8 +247,8 @@ describe('Order model', () => {
       id: 'order123',
       data: () => ({
         user: 'user456',
-        rapydPaymentId: 'payment_test123',
-        paymentMethod: 'rapyd',
+        airwallexPaymentIntentId: 'int_test123',
+        paymentMethod: 'airwallex',
         status: 'paid',
         total: 89.99,
       }),
@@ -258,53 +257,55 @@ describe('Order model', () => {
     expect(result).toEqual({
       id: 'order123',
       user: 'user456',
-      rapydPaymentId: 'payment_test123',
-      paymentMethod: 'rapyd',
+      airwallexPaymentIntentId: 'int_test123',
+      paymentMethod: 'airwallex',
       status: 'paid',
       total: 89.99,
     });
   });
 });
 
-describe('Rapyd Payment verification logic', () => {
+describe('Airwallex Payment Intent verification logic', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  it('retrieves a valid Payment from Rapyd', async () => {
-    mockRapydRetrieve.mockResolvedValueOnce({
-      id: 'payment_test123',
-      status: 'CLO',
+  it('retrieves a valid Payment Intent from Airwallex', async () => {
+    mockAirwallexRetrieve.mockResolvedValueOnce({
+      id: 'int_test123',
+      status: 'SUCCEEDED',
       amount: 99.99,
       currency: 'USD',
       metadata: { userId: 'user456' },
     });
 
-    const rapyd = require('../src/services/rapyd');
-    const payment = await rapyd.retrievePayment('payment_test123');
+    const airwallex = require('../src/services/airwallex');
+    const intent = await airwallex.retrievePaymentIntent('int_test123');
 
-    expect(payment.id).toBe('payment_test123');
-    expect(payment.status).toBe('CLO');
-    expect(mockRapydRetrieve).toHaveBeenCalledWith('payment_test123');
+    expect(intent.id).toBe('int_test123');
+    expect(intent.status).toBe('SUCCEEDED');
+    expect(mockAirwallexRetrieve).toHaveBeenCalledWith('int_test123');
   });
 
-  it('throws when Rapyd retrieve fails', async () => {
-    mockRapydRetrieve.mockRejectedValueOnce(new Error('Rapyd: payment not found'));
+  it('throws when Airwallex retrieve fails', async () => {
+    mockAirwallexRetrieve.mockRejectedValueOnce(new Error('Airwallex: intent not found'));
 
-    const rapyd = require('../src/services/rapyd');
-    await expect(rapyd.retrievePayment('payment_invalid')).rejects.toThrow(
-      /payment not found/i
+    const airwallex = require('../src/services/airwallex');
+    await expect(airwallex.retrievePaymentIntent('int_invalid')).rejects.toThrow(
+      /intent not found/i
     );
   });
 
-  // Mirrors the classifyRapydStatus helper in the controller.
+  // Mirrors the classifyAirwallexStatus helper in the controller.
   const classify = (status) => {
-    const SUCCESS = new Set(['CLO', 'CLOSED', 'COMPLETED', 'SUCCEEDED', 'PAID']);
-    const PENDING = new Set(['ACT', 'ACTIVE', 'ACTIVATED', 'NEW', 'PENDING']);
-    const FAILED = new Set([
-      'CAN', 'EXP', 'ERR', 'REJ',
-      'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'FAILED',
+    const SUCCESS = new Set(['SUCCEEDED']);
+    const PENDING = new Set([
+      'REQUIRES_PAYMENT_METHOD',
+      'REQUIRES_CUSTOMER_ACTION',
+      'REQUIRES_CAPTURE',
+      'PENDING',
     ]);
+    const FAILED = new Set(['CANCELLED', 'CANCELED', 'EXPIRED', 'FAILED']);
     if (!status) return 'unknown';
     const s = String(status).toUpperCase();
     if (SUCCESS.has(s)) return 'success';
@@ -313,27 +314,21 @@ describe('Rapyd Payment verification logic', () => {
     return 'unknown';
   };
 
-  it('maps CLO Rapyd status to success → paid order', () => {
-    expect(classify('CLO')).toBe('success');
-  });
-
-  it('maps SUCCEEDED Rapyd status to success', () => {
+  it('maps SUCCEEDED Airwallex status to success → paid order', () => {
     expect(classify('SUCCEEDED')).toBe('success');
   });
 
-  it('maps ACT Rapyd status to pending → pending order', () => {
-    expect(classify('ACT')).toBe('pending');
+  it('maps REQUIRES_CAPTURE Airwallex status to pending → pending order', () => {
+    expect(classify('REQUIRES_CAPTURE')).toBe('pending');
   });
 
-  it('maps NEW Rapyd status to pending', () => {
-    expect(classify('NEW')).toBe('pending');
+  it('maps REQUIRES_PAYMENT_METHOD Airwallex status to pending', () => {
+    expect(classify('REQUIRES_PAYMENT_METHOD')).toBe('pending');
   });
 
-  it('maps REJ/CAN/EXP/ERR to failed', () => {
-    expect(classify('REJ')).toBe('failed');
-    expect(classify('CAN')).toBe('failed');
-    expect(classify('EXP')).toBe('failed');
-    expect(classify('ERR')).toBe('failed');
+  it('maps CANCELLED/EXPIRED to failed', () => {
+    expect(classify('CANCELLED')).toBe('failed');
+    expect(classify('EXPIRED')).toBe('failed');
   });
 
   it('returns unknown for unrecognised statuses', () => {
@@ -342,27 +337,27 @@ describe('Rapyd Payment verification logic', () => {
   });
 });
 
-describe('Order creation idempotency (rapydPaymentId)', () => {
-  it('returns existing order when rapydPaymentId already used', () => {
+describe('Order creation idempotency (airwallexPaymentIntentId)', () => {
+  it('returns existing order when airwallexPaymentIntentId already used', () => {
     const existingOrders = [
-      { id: 'order123', rapydPaymentId: 'payment_test123', status: 'paid' },
+      { id: 'order123', airwallexPaymentIntentId: 'int_test123', status: 'paid' },
     ];
 
-    const rapydPaymentId = 'payment_test123';
-    const found = existingOrders.find((o) => o.rapydPaymentId === rapydPaymentId);
+    const paymentIntentId = 'int_test123';
+    const found = existingOrders.find((o) => o.airwallexPaymentIntentId === paymentIntentId);
 
     expect(found).toBeDefined();
     expect(found.id).toBe('order123');
     expect(found.status).toBe('paid');
   });
 
-  it('proceeds with new order when rapydPaymentId is unique', () => {
+  it('proceeds with new order when airwallexPaymentIntentId is unique', () => {
     const existingOrders = [
-      { id: 'order123', rapydPaymentId: 'payment_test123', status: 'paid' },
+      { id: 'order123', airwallexPaymentIntentId: 'int_test123', status: 'paid' },
     ];
 
-    const rapydPaymentId = 'payment_new456';
-    const found = existingOrders.find((o) => o.rapydPaymentId === rapydPaymentId);
+    const paymentIntentId = 'int_new456';
+    const found = existingOrders.find((o) => o.airwallexPaymentIntentId === paymentIntentId);
 
     expect(found).toBeUndefined();
   });

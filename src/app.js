@@ -6,14 +6,14 @@
  * to allow clean testing without starting the HTTP server.
  *
  * IMPORTANT — Webhook route ordering:
- * The /api/rapyd/webhook route is registered BEFORE the global
+ * The /api/airwallex/webhook route is registered BEFORE the global
  * express.json() middleware so that the raw request body is preserved
  * for HMAC signature verification. Registering it after express.json()
- * would cause rapyd.webhooks.constructEvent() to throw a signature
+ * would cause airwallex.webhooks.constructEvent() to throw a signature
  * mismatch error.
  *
  * Migration note: the legacy /api/stripe webhook route has been removed
- * as part of the Stripe → Rapyd cutover. Any in-flight Stripe deliveries
+ * as part of the payments migration. Any in-flight Stripe deliveries
  * will receive a 404 and Stripe-side retries will eventually drop them.
  */
 
@@ -117,17 +117,17 @@ app.use('/api/auth/', authLimiter);
 // ─── Webhook Routes (MUST be before express.json()) ──────────────────────────
 
 /**
- * Register Rapyd webhook routes BEFORE the global JSON body parser.
+ * Register Airwallex webhook routes BEFORE the global JSON body parser.
  *
- * Rapyd signature verification requires the raw, unparsed request body as a
- * Buffer. If express.json() runs first, it consumes the stream and replaces
+ * Airwallex signature verification requires the raw, unparsed request body as
+ * a Buffer. If express.json() runs first, it consumes the stream and replaces
  * req.body with a parsed object, which causes
- * rapyd.webhooks.constructEvent() to throw a signature mismatch error.
+ * airwallex.webhooks.constructEvent() to throw a signature mismatch error.
  *
  * The route module applies express.raw({ type: 'application/json' })
  * internally so that req.body is a Buffer only for the webhook endpoint.
  */
-app.use('/api/rapyd', require('./routes/api/rapyd'));
+app.use('/api/airwallex', require('./routes/api/airwallex'));
 
 // ─── Request Parsing ─────────────────────────────────────────────────────────
 
